@@ -23,7 +23,7 @@ class training_class():
     """ 
     
     def __init__(self, params_dict):
-        """
+        """   
         Constructor class for training process
 
         Args:
