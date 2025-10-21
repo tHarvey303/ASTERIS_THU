@@ -545,17 +545,17 @@ def make_stack(scale_factor, in_dir, out_dir, hdu_num, nmean = 8, make_val = Fal
         if 'TELAPSE' in header_tmp:
             header_tmp.remove('TELAPSE')
             header_tmp['XPOSURE'] = (exp_total, '[s] Total exposure time')
-            header = merge_headers(header[:8], header_tmp) # discard all other exposure/spacescraft info
-            header['NAXIS2'] = valid_region[1] - valid_region[0]
-            header['NAXIS1'] = valid_region[3] - valid_region[2]
+        header = merge_headers(header[:8], header_tmp) # discard all other exposure/spacescraft info
+        header['NAXIS2'] = valid_region[1] - valid_region[0]
+        header['NAXIS1'] = valid_region[3] - valid_region[2]
     else:
         cropped_images,header_tmp = crop_images_to_valid_region(image_stack, [0, image_stack.shape[1], 0, image_stack.shape[2]],header)
         if 'TELAPSE' in header_tmp:
             header_tmp.remove('TELAPSE')
             header_tmp['XPOSURE'] = (exp_total, '[s] Total exposure time')
-            header = merge_headers(header[:8], header_tmp) # discard all other exposure/spacescraft info
-            header['NAXIS2'] = image_stack.shape[1]
-            header['NAXIS1'] = image_stack.shape[2]
+        header = merge_headers(header[:8], header_tmp) # discard all other exposure/spacescraft info
+        header['NAXIS2'] = image_stack.shape[1]
+        header['NAXIS1'] = image_stack.shape[2]
     
     # ---------- Optional per-voxel sigma-clipping along z ----------
     if z_axis_clip > 0:
