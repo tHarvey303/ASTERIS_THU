@@ -112,7 +112,7 @@ Ensure:
 
 - We provide two variants of pre-trained ASTERIS models--4-frame and 8-frame--that can be directly tested. They are trained separately for JWST/NIRCam long-wavelength (center wavelength ≥ 2.5 μm) and short-wavelength (center wavelength < 2.5 μm), using the imaging data from **Program IDs [3293](https://www.stsci.edu/jwst-program-info/download/jwst/pdf/3293/), [1210](https://www.stsci.edu/jwst/phase2-public/1210.pdf), [3215](https://www.stsci.edu/jwst-program-info/download/jwst/pdf/3215/), and [1963](https://www.stsci.edu/jwst/phase2-public/1963.pdf)**.
 
-- The **[pre-trained model](https://doi.org/10.5281/zenodo.17114980)** can be downloaded here.
+- The **[pre-trained model](https://doi.org/10.5281/zenodo.18358472)** can be downloaded here.
 
 
 Run the testing script:
