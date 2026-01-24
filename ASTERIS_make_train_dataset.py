@@ -18,7 +18,7 @@
 # ---
 # ## ✉️ Contact
 # For questions or potential collaborations, please contact Yuduo Guo at `gyd@mail.tsinghua.edu.cn`.
-# Copyright (c) 2025 Yuduo Guo. All rights reserved.
+# Copyright (c) 2025 Yuduo Guo.
 # Date: 2025-09-12
 from asteris.utils import make_train_datasets
 
