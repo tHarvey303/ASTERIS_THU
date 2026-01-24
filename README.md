@@ -1,4 +1,4 @@
-# 🌌🌟 ASTERIS: Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising 
+<img width="1502" height="390" alt="image" src="https://github.com/user-attachments/assets/0b29f957-dcbe-4be1-a0a1-8efed031d43c" /># 🌌🌟 ASTERIS: Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising 
 
 [![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
@@ -148,17 +148,17 @@ python ASTERIS_test_demo_long.py
 
 If you use this code, please cite the companion paper where the original method appeared:
 
-Guo Y., Zhang H., Li M., et al. "Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising". Science (2025). 
+Guo Y., Zhang H., Li M., et al. "Deeper detection limits in astronomical imaging using self-supervised spatio-temporal denoising". Science (2026). 
 DOI: [https://doi.org/10.1126/science.ady9404](https://doi.org/10.1126/science.ady9404)
 
 <pre>@article{Guo2025ASTERIS, 
-title = {Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising}, 
+title = {Deeper detection limits in astronomical imaging using self-supervised spatio-temporal denoising}, 
 author = {Guo, Yuduo and Zhang, Hao and Li, Mingyu and Yu, Fujiang and Wu, Yunjing and  Hao, Yuhan and Huang, Song and Liang, Yongming and Lin, Xiaojing and Li, Xinyang and Wu, Jiamin and Cai, Zheng and Dai, Qionghai}, 
 journal = {Science}, 
 year = {2025}, 
 volume = {999}, 
 pages = {1--12}, 
-doi = {10.1234/astro.2025.12345}
+doi = {10.1126/science.ady9404}
 }</pre>
 
 Should you have any questions regarding this code and collaboration inquiries, please contact Yuduo Guo at gyd@mail.tsinghua.edu.cn.
