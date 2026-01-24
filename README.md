@@ -148,7 +148,8 @@ python ASTERIS_test_demo_long.py
 
 If you use this code, please cite the companion paper where the original method appeared:
 
-Guo Y., Zhang H., Li M., et al. "Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising". Science (2025). doi: [https://doi.org/****](https://doi.org/****)
+Guo Y., Zhang H., Li M., et al. "Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising". Science (2025). 
+DOI: [https://doi.org/10.1126/science.ady9404](https://doi.org/10.1126/science.ady9404)
 
 <pre>@article{Guo2025ASTERIS, 
 title = {Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising}, 
