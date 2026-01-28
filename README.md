@@ -1,3 +1,8 @@
+# 🌌🌟 ASTERIS: Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising 
+
+[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
+
 **Introduction**: Noise fundamentally constrains the detection limit of astronomical observations. We present **ASTERIS**, a self-supervised denoising transformer **integrating spatiotemporal information across multiple exposures** to enhance detection limits  (the backbone was inspired by **[Restormer](https://github.com/swz30/Restormer)**). Quantitative mock tests are developed for scientific benchmarking, illustrating that ASTERIS improves practical detection limits over existing methods by **1.0 magnitude** at 90% completeness and purity, while preserving point-spread-function fidelity and photometric accuracy. Experimental validations on the 🪐**James Webb Space Telescope (JWST)** and the ☄️**Subaru Telescope** demonstrate ASTERIS’s capability in resolving previously undetectable features.
 
 **Version**: ✨1.0
