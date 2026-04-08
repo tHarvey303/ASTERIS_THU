@@ -5,6 +5,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2602.17205-b31b1b.svg)](https://arxiv.org/abs/2602.17205)
 [![Model](https://img.shields.io/badge/model-Zenodo-orange.svg)](https://doi.org/10.5281/zenodo.17114980)
 [![Demo Data](https://img.shields.io/badge/demo_data-Zenodo-orange.svg)](https://doi.org/10.5281/zenodo.17105027)
+[![Homepage](https://img.shields.io/badge/Author-Yuduo_Guo-blueviolet.svg)](https://freemercury.github.io)
 
 **ASTERIS** is a self-supervised denoising framework for multi-exposure astronomical imaging. It integrates spatiotemporal information across exposures using a modified [Restormer](https://github.com/swz30/Restormer) backbone, improving practical detection limits by **1.0 magnitude** at 90% completeness and purity while preserving PSF fidelity and photometric accuracy.
 
@@ -162,7 +163,7 @@ ASTERIS_THU/
 
 ## Contact
 
-For questions or collaboration inquiries: **Yuduo Guo** - gyd@mail.tsinghua.edu.cn
+For questions or collaboration inquiries: **[Yuduo Guo](https://freemercury.github.io)** - gyd@mail.tsinghua.edu.cn
 
 ## License
 
