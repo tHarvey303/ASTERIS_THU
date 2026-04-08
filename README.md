@@ -1,172 +1,169 @@
-# 🌌🌟 ASTERIS: Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising 
+# ASTERIS: Deeper Detection Limits in Astronomical Imaging Using Self-supervised Spatiotemporal Denoising
 
-[![Build Status](https://img.shields.io/badge/build-passing-brightgreen)]()
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)]()
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Paper (Science)](https://img.shields.io/badge/Science-doi%3A10.1126%2Fscience.ady9404-red.svg)](https://www.science.org/doi/10.1126/science.ady9404)
+[![arXiv](https://img.shields.io/badge/arXiv-2602.17205-b31b1b.svg)](https://arxiv.org/abs/2602.17205)
+[![Model](https://img.shields.io/badge/model-Zenodo-orange.svg)](https://doi.org/10.5281/zenodo.17114980)
+[![Demo Data](https://img.shields.io/badge/demo_data-Zenodo-orange.svg)](https://doi.org/10.5281/zenodo.17105027)
 
-**Introduction**: Noise fundamentally constrains the detection limit of astronomical observations. We present **ASTERIS**, a self-supervised denoising transformer **integrating spatiotemporal information across multiple exposures** to enhance detection limits  (the backbone was inspired by **[Restormer](https://github.com/swz30/Restormer)**). Quantitative mock tests are developed for scientific benchmarking, illustrating that ASTERIS improves practical detection limits over existing methods by **1.0 magnitude** at 90% completeness and purity, while preserving point-spread-function fidelity and photometric accuracy. Experimental validations on the 🪐**James Webb Space Telescope (JWST)** and the ☄️**Subaru Telescope** demonstrate ASTERIS’s capability in resolving previously undetectable features.
+**ASTERIS** is a self-supervised denoising framework for multi-exposure astronomical imaging. It integrates spatiotemporal information across exposures using a modified [Restormer](https://github.com/swz30/Restormer) backbone, improving practical detection limits by **1.0 magnitude** at 90% completeness and purity while preserving PSF fidelity and photometric accuracy.
 
-**Version**: ✨1.0
+Validated on the **James Webb Space Telescope (JWST)** and the **Subaru Telescope**.
 
-**Copyright**: 2025, Y. Guo, H. Zhang, M. Li, J. Wu, Z. Cai, and Q. Dai
-
-**doi**: [https://doi.org/10.1126/science.ady9404](https://doi.org/10.1126/science.ady9404)
-
+> Y. Guo, H. Zhang, M. Li, F. Yu, Y. Wu, Y. Hao, S. Huang, Y. Liang, X. Lin, X. Li, J. Wu, Z. Cai, Q. Dai. *Deeper detection limits in astronomical imaging using self-supervised spatiotemporal denoising*. **Science** (2025). [doi:10.1126/science.ady9404](https://www.science.org/doi/10.1126/science.ady9404)
 
 ---
 
-## 📖 Table of Contents
-- [Installation](#-installation)
-- [Usage](#-usage)
-- [Examples](#-examples)
-- [Citation](#-citation)
-- [License](#-license)
+## Pre-trained Models
+
+| Model | Wavelength | Frames | Download |
+|-------|-----------|--------|----------|
+| `ASTERIS8_nrcshort` | < 2.5 um | 8 | [Zenodo](https://doi.org/10.5281/zenodo.17114980) |
+| `ASTERIS8_nrclong` | >= 2.5 um | 8 | [Zenodo](https://doi.org/10.5281/zenodo.17114980) |
+| `ASTERIS4_nrcshort` | < 2.5 um | 4 | [Zenodo](https://doi.org/10.5281/zenodo.17114980) |
+| `ASTERIS4_nrclong` | >= 2.5 um | 4 | [Zenodo](https://doi.org/10.5281/zenodo.17114980) |
+
+These models can be directly applied to **JWST/NIRCam data from F070W to F480M** with arbitrary exposure time. Pixel scale must be **0.04 arcsec/pixel**.
+
 ---
 
-## 🔧 Installation
+## Installation
 
-**Environment**
-
-- Ubuntu 20.04.6
-- CUDA 12.1
-- CONDA 23.9.0
-- Python 3.9.23
-- Pytorch 2.5.0+cu121
-
-Other versions may work, but we cannot guarantee full compatibility.
-
-Two ways are recommended to set up the environment. **We recommend using the `environment.yml` method** for reproducibility, but manual installation is also possible.
+**Requirements**: Ubuntu 20.04, CUDA 12.1, Python 3.9, PyTorch 2.5.0
 
 ```bash
-# Clone repository
 git clone https://github.com/freemercury/ASTERIS_THU.git
+cd ASTERIS_THU
 
-# Create environment with environment.yml
+# Option 1: from environment file (recommended)
 conda env create -f environment.yml
-```
 
-If you prefer to set up the environment manually, follow these steps:
-
-```bash
-# 1. Create a new conda environment with Python 3.9
+# Option 2: manual setup
 conda create -n asteris python=3.9
-
-# 2. Activate the environment
 conda activate asteris
-
-# 3. Install core dependencies
-pip install numpy==1.26
-pip install torch==2.5.0+cu121 torchvision==0.20.0+cu121 torchaudio==2.5.0+cu121 --index-url https://download.pytorch.org/whl/cu121
-
-# 4. Install any additional packages you need
-pip install tqdm scipy astropy tifffile scikit-image einops swanlab natsort pathlib
+pip install torch==2.5.0+cu121 torchvision==0.20.0+cu121 torchaudio==2.5.0+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121
+pip install numpy==1.26 tqdm scipy astropy tifffile scikit-image einops swanlab natsort
 ```
-
 
 ---
 
-## 📂 Usage
-
-ASTERIS is designed for multi-exposure astronomical imaging data denoising. Below is the standard workflow.
-**ASTERIS can be directly applied to the JWST/NIRCam data from F070W to F480M with arbitary exposure time.**
-ASTERIS_8 requires 8 astrometrically-aligned fits.
-ASTERIS_4 requires 4 astrometrically-aligned fits.
-
-
-### 1️⃣ Prepare Training Data
-
-- The training process takes as input a set of **3D `.tif` image stacks** under `./train_datasets/`.  
-- In each stack, every frame must be **astrometrically aligned to the same WCS reference**, typically generated during the data reduction of astronomical imaging data.
-- Pixle scale of images to be denoised by the pre-trained model needs to be set to **0.04 arcseconds**.
-
-### 2️⃣ Convert FITS to Training Stacks
-
-- Make subfolders under `./reduction/`.
-- Place each **astronomically aligned `.fits` files** of the same pointing into the corresponding `./reduction/XX/`.
-- Each subfolder needs **≥ 8/16 `.fits`** files for **ASTERIS_4/8 training**.
-- Run the following script to convert them into `.tif` stacks recognizable by ASTERIS:  
+## Quick Start: Demo
 
 ```bash
-python ASTERIS_make_train_dataset.py
+# 1. Download demo data -> ./test_datasets/
+#    https://doi.org/10.5281/zenodo.17105027
+
+# 2. Download pre-trained models -> ./pth/
+#    https://doi.org/10.5281/zenodo.17114980
+
+# 3. Run
+python ASTERIS_test_demo_short.py   # short wavelengths (< 2.5 um)
+python ASTERIS_test_demo_long.py    # long wavelengths (>= 2.5 um)
+
+# Results saved to ./result/
 ```
 
-- Script parameters are defined inside `ASTERIS_make_train_dataset.py` and can be tuned as needed.
+---
 
-### 3️⃣ Train a Model
+## Usage
 
-To start training from scratch, run:
-```bash
-python ASTERIS_train.py
-```
-- All training parameters are configurable in the script itself.
+### Inference on Your Data
 
+1. Place astrometrically-aligned `.fits` files in subdirectories under `./test_datasets/`
+   - ASTERIS_8 requires >= 8 files per subdirectory
+   - ASTERIS_4 requires >= 4 files per subdirectory
 
-### 4️⃣ Test the Model
+2. Configure `ASTERIS_test.py`:
 
-Place your .fits test images under ./test_datasets/.
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `denoise_model` | Model name (e.g., `ASTERIS8_nrclong`) | - |
+| `test_mode` | Number of input frames: `4` or `8` | `8` |
+| `GPU` | GPU index (e.g., `'0'`, `'0,1'`) | `'0'` |
+| `patch_xy` | Patch size (must be divisible by 8) | `800` |
+| `overlap_factor` | Overlap between patches | `0.1` |
+| `hdu_num` | FITS HDU index for science data | `1` |
 
-Ensure:
-
-- All FITS files in the same sub-directory are astrometrically aligned.
-
-- When using ASTERIS_*M*, each sub-directory must contain at least *M* individual `.fits` files — for example, ≥ 4 for ASTERIS_4, ≥ 8 for ASTERIS_8.
-
-- We provide two variants of pre-trained ASTERIS models--4-frame and 8-frame--that can be directly tested. They are trained separately for JWST/NIRCam long-wavelength (center wavelength ≥ 2.5 μm) and short-wavelength (center wavelength < 2.5 μm), using the imaging data from **Program IDs [3293](https://www.stsci.edu/jwst-program-info/download/jwst/pdf/3293/), [1210](https://www.stsci.edu/jwst/phase2-public/1210.pdf), [3215](https://www.stsci.edu/jwst-program-info/download/jwst/pdf/3215/), and [1963](https://www.stsci.edu/jwst/phase2-public/1963.pdf)**.
-
-- The **[pre-trained model](https://doi.org/10.5281/zenodo.18358472)** can be downloaded here.
-
-
-Run the testing script:
+3. Run:
 ```bash
 python ASTERIS_test.py
 ```
 
-✅ By following the above steps, you can prepare datasets, train new models, or evaluate ASTERIS on your own astronomical imaging data.
+### Training a Custom Model
 
----
+1. Place astrometrically-aligned `.fits` files under `./reduction_datasets/<pointing>/`
+   - Each subdirectory needs >= 8 files (for ASTERIS_8) or >= 16 files (for ASTERIS_4)
 
-## 💡 Examples
-
-We provide demo data and pre-trained model that can be directly tested with ASTERIS.  
-
-1. Download the **[demo data](https://doi.org/10.5281/zenodo.17105027)** from [https://doi.org/10.5281/zenodo.17105027](https://doi.org/10.5281/zenodo.17105027).   
-2. Unzip the archive and place the contents into `./test_datasets/`. 
-3. Download the **[pre-trained model](https://doi.org/10.5281/zenodo.17114980)** from [https://doi.org/10.5281/zenodo.17114980](https://doi.org/10.5281/zenodo.17114980). 
-4. Unzip the archive and place the contents into `./pth/`.  
-5. Run the following scripts to test the demo datasets:
+2. Convert to training stacks:
 ```bash
-# Test on demo (short wavelengths)
-python ASTERIS_test_demo_short.py
-
-# Test on demo (long wavelengths)
-python ASTERIS_test_demo_long.py
+python ASTERIS_make_train_dataset.py
 ```
-4. The results will be automatically saved under `./results/`.
+
+3. Train:
+```bash
+python ASTERIS_train.py
+```
+
+Key training parameters (set inside the script):
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `train_mode` | Frame count: `4` or `8` | `8` |
+| `GPU` | GPU indices | `'0,1,2,3,4,6,7'` |
+| `n_epochs` | Training epochs | `20` |
+| `learning_rate` | Learning rate | `1.5e-4` |
+| `patch_xy` | Patch size | `128` |
+| `batch_size` | Per-GPU batch size | `3` |
 
 ---
 
-## 📝 Citation
+## Project Structure
 
-If you use this code, please cite the companion paper where the original method appeared:
+```
+ASTERIS_THU/
+├── ASTERIS_train.py                 # Training entry point
+├── ASTERIS_test.py                  # Inference entry point
+├── ASTERIS_test_demo_short.py       # Demo: short wavelengths
+├── ASTERIS_test_demo_long.py        # Demo: long wavelengths
+├── ASTERIS_make_train_dataset.py    # FITS -> training stacks
+├── asteris/
+│   ├── ASTERIS_net_4.py             # 4-frame network
+│   ├── ASTERIS_net_8.py             # 8-frame network
+│   ├── train.py                     # Training logic
+│   ├── test.py                      # Inference logic
+│   ├── data_process.py              # Data loading and patching
+│   └── utils.py                     # FITS I/O, stacking, preprocessing
+├── pth/                             # Pre-trained model weights
+├── train_datasets/                  # Training data (3D .tif stacks)
+├── test_datasets/                   # Test data (.fits files)
+└── result/                          # Inference outputs
+```
 
-Guo Y., Zhang H., Li M., et al. "Deeper detection limits in astronomical imaging using self-supervised spatio-temporal denoising". Science (2026). 
-DOI: [https://doi.org/10.1126/science.ady9404](https://doi.org/10.1126/science.ady9404)
+---
 
-<pre>@article{Guo2025ASTERIS, 
-title = {Deeper detection limits in astronomical imaging using self-supervised spatio-temporal denoising}, 
-author = {Guo, Yuduo and Zhang, Hao and Li, Mingyu and Yu, Fujiang and Wu, Yunjing and  Hao, Yuhan and Huang, Song and Liang, Yongming and Lin, Xiaojing and Li, Xinyang and Wu, Jiamin and Cai, Zheng and Dai, Qionghai}, 
-journal = {Science}, 
-year = {2025}, 
-volume = {999}, 
-pages = {1--12}, 
-doi = {10.1126/science.ady9404}
-}</pre>
+## Citation
 
-Should you have any questions regarding this code and collaboration inquiries, please contact Yuduo Guo at gyd@mail.tsinghua.edu.cn.
+```bibtex
+@article{Guo2025ASTERIS,
+  title   = {Deeper detection limits in astronomical imaging using
+             self-supervised spatiotemporal denoising},
+  author  = {Guo, Yuduo and Zhang, Hao and Li, Mingyu and Yu, Fujiang
+             and Wu, Yunjing and Hao, Yuhan and Huang, Song
+             and Liang, Yongming and Lin, Xiaojing and Li, Xinyang
+             and Wu, Jiamin and Cai, Zheng and Dai, Qionghai},
+  journal = {Science},
+  year    = {2025},
+  doi     = {10.1126/science.ady9404}
+}
+```
 
 ---
 
-## 📜 License
+## Contact
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+For questions or collaboration inquiries: **Yuduo Guo** - gyd@mail.tsinghua.edu.cn
 
----
+## License
+
+MIT License. Copyright (c) 2025 Yuduo Guo. See [LICENSE](LICENSE) for details.

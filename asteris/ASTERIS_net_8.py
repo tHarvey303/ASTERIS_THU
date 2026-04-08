@@ -1,4 +1,4 @@
-# ASTERIS: Pushing Detection Limits of Astronomical Imaging via Self-supervised Spatiotemporal Denoising
+# ASTERIS: Deeper detection limits in astronomical imaging using self-supervised spatiotemporal denoising
 # Author: Yuduo Guo, Hao Zhang, Mingyu Li
 # Tsinghua University, Beijing, China
 
