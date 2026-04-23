@@ -36,5 +36,16 @@ clip_threshold = 3.0
 datasets_path = "./train_datasets/"
 # Scale factor for z-normalisation
 scale_factor = 4.0
-make_train_datasets(scale_factor, mse_select, hdu_num, z_axis_clip, 
-                    clip_threshold, reduction_image_path, datasets_path)
+# Minimum number of frames that must overlap at a pixel for it to be included
+# in the training region. None (default) = require all frames to overlap.
+# Set to 8 (ASTERIS4) or 16 (ASTERIS8) to expand coverage to regions that are
+# only partially covered by the dither pattern. See also min_frame_coverage.
+min_coverage = None
+# Fraction of pixels a frame must cover within the expanded region to be kept.
+# Only used when min_coverage is not None. Lower to include more frames from
+# the edges of the mosaic (at the cost of more masked pixels per frame).
+min_frame_coverage = 0.5
+make_train_datasets(scale_factor, mse_select, hdu_num, z_axis_clip,
+                    clip_threshold, reduction_image_path, datasets_path,
+                    min_coverage=min_coverage,
+                    min_frame_coverage=min_frame_coverage)

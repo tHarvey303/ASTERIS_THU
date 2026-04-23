@@ -283,6 +283,74 @@ def find_valid_region(images):
 
     return y_min, y_max, x_min, x_max
 
+def find_region_with_min_coverage(image_stack, n_min):
+    """
+    Find the bounding box of pixels where at least n_min frames have valid data.
+
+    This generalises find_valid_region: instead of requiring every frame to be
+    valid at a pixel (equivalent to n_min == N_frames), any integer threshold
+    can be specified.  Set n_min to the number of temporal frames needed for one
+    ASTERIS training sample (patch_t * 2, e.g. 8 for ASTERIS4 or 16 for
+    ASTERIS8) to expand the usable training footprint beyond the all-frames
+    intersection when frames cover overlapping but non-identical sky areas.
+
+    Args:
+        image_stack (np.ndarray): (N, H, W) float array; NaN marks no-data pixels.
+        n_min (int): minimum number of frames that must have finite (non-NaN) data
+            at a pixel for it to be included in the returned region.
+
+    Returns:
+        y_min, y_max, x_min, x_max (int): bounding box of the qualifying region.
+
+    Raises:
+        ValueError: if no pixel satisfies coverage >= n_min.
+    """
+    coverage = (~np.isnan(image_stack)).sum(axis=0)  # (H, W) integer map
+    valid_mask = coverage >= n_min
+    if not valid_mask.any():
+        raise ValueError(
+            f"No pixels have coverage >= {n_min}. "
+            f"Maximum coverage in this stack is {int(coverage.max())}."
+        )
+    coords = np.argwhere(valid_mask)
+    y_min, x_min = coords.min(axis=0)
+    y_max, x_max = coords.max(axis=0) + 1
+    return y_min, y_max, x_min, x_max
+
+
+def select_frames_for_region(image_stack, region, min_frame_coverage=0.5):
+    """
+    Identify which frames have sufficient valid pixel coverage over a spatial region.
+
+    When frames come from different dither positions, a frame that does not
+    overlap a given sky region will be almost entirely NaN/zero there.  Including
+    such frames in a training stack wastes temporal slots and causes many patches
+    to fail the zero-ratio filter.  This function removes them so that only frames
+    with real signal in the region are retained.
+
+    Args:
+        image_stack (np.ndarray): (N, H, W) float array; NaN marks no-data pixels.
+        region (tuple): (y_min, y_max, x_min, x_max) bounding box as returned by
+            find_valid_region or find_region_with_min_coverage.
+        min_frame_coverage (float): fraction of pixels within the region that must
+            be valid (non-NaN) in a frame for it to be selected.  Default 0.5.
+
+    Returns:
+        selected_indices (np.ndarray of int): indices into the first axis of
+            image_stack for frames that meet the coverage threshold, in their
+            original order.
+    """
+    y_min, y_max, x_min, x_max = region
+    crop = image_stack[:, y_min:y_max, x_min:x_max]           # (N, h, w)
+    n_pixels = (y_max - y_min) * (x_max - x_min)
+    valid_frac = (~np.isnan(crop)).sum(axis=(1, 2)) / n_pixels  # (N,)
+    selected = np.where(valid_frac >= min_frame_coverage)[0]
+    print(f"[select_frames_for_region] {len(selected)}/{len(image_stack)} frames "
+          f"have >= {min_frame_coverage:.0%} coverage in region "
+          f"y=[{y_min}:{y_max}], x=[{x_min}:{x_max}]")
+    return selected
+
+
 def crop_images_to_valid_region(images, valid_region, header = []):
     """
     Crop a 3D stack to the provided valid region. If a FITS/WCS header is given,
@@ -644,9 +712,32 @@ def restore_fits(scale_factor,restore_clip_part, image_mean, img_reference, ref_
     hdu.writeto(fits_savename,overwrite=True)
 
 
-def make_train_datasets(scale_factor, mse_select, hdu_num, z_axis_clip, clip_threshold, input_path, output_path):
+def make_train_datasets(scale_factor, mse_select, hdu_num, z_axis_clip, clip_threshold,
+                        input_path, output_path, min_coverage=None,
+                        min_frame_coverage=0.5):
     """
     Preprocess FITS image stacks into normalized, sigma-clipped 3D TIFF datasets for training.
+
+    Args:
+        scale_factor (float): divisor applied after z-score normalisation.
+        mse_select (int): if 1, reorder frames by MSE quality before saving.
+        hdu_num (int): FITS HDU index to read.
+        z_axis_clip (float): per-pixel sigma-clip threshold along the temporal axis;
+            0 disables.
+        clip_threshold (float): global 3D sigma-clip threshold; 0 disables.
+        input_path (str): root directory; every subdirectory with .fits files is
+            processed as a separate pointing.
+        output_path (str): directory where output .tif stacks are written.
+        min_coverage (int, optional): minimum number of frames that must have
+            valid data at a pixel for it to be included in the training region.
+            When None (default), requires ALL frames to overlap (existing
+            behaviour).  Set to the number of temporal frames needed per
+            training sample — 8 for ASTERIS4 (patch_t=4) or 16 for ASTERIS8
+            (patch_t=8) — to include regions covered by only a subset of frames,
+            maximising the usable training footprint for widely dithered data.
+        min_frame_coverage (float): fraction of pixels within the expanded region
+            that a frame must cover to be retained in the output stack.  Only
+            used when min_coverage is not None.  Default 0.5.
     """
     # Ensure the output folder exists
     os.makedirs(output_path, exist_ok=True)
@@ -666,48 +757,66 @@ def make_train_datasets(scale_factor, mse_select, hdu_num, z_axis_clip, clip_thr
         for fname in fits_files:
             image_stack.append(fits.open(fname)[hdu_num].data)
         image_stack = np.array(image_stack).astype(np.float32)
-        # Reference header (take it from the last FITS file read)
+        # Reference header (updated below if frame selection changes the stack)
         header = fits.open(fname)[hdu_num].header
-        
+
         # NaN masking
         image_stack[image_stack == 0] = np.nan
 
-        # Identify region valid in all frames (run training on valid regions only)
-        valid_region = find_valid_region(image_stack)
+        # Determine the spatial region to use for training
+        if min_coverage is None:
+            # Default: require all frames to be valid at every pixel
+            valid_region = find_valid_region(image_stack)
+        else:
+            # Expanded: require at least min_coverage frames at every pixel,
+            # then drop frames that barely overlap the expanded region
+            valid_region = find_region_with_min_coverage(image_stack, min_coverage)
+            selected = select_frames_for_region(image_stack, valid_region,
+                                                min_frame_coverage=min_frame_coverage)
+            if len(selected) < min_coverage:
+                warnings.warn(
+                    f"[make_train_datasets] Only {len(selected)} frames meet "
+                    f"min_frame_coverage={min_frame_coverage:.0%} in {rel}; "
+                    f"fewer than min_coverage={min_coverage}. "
+                    f"Consider lowering min_frame_coverage."
+                )
+            image_stack = image_stack[selected]
+            header = fits.open(fits_files[int(selected[0])])[hdu_num].header
         print(valid_region)
-        
+
         # Crop images to the valid region and update WCS header accordingly
-        cropped_images,header_tmp = crop_images_to_valid_region(image_stack, valid_region,header)
+        cropped_images, header_tmp = crop_images_to_valid_region(image_stack, valid_region, header)
         # Apply sigma-clipping along the z-axis (temporal axis) to remove strong outliers
         if z_axis_clip > 0:
-            cropped_images = sigma_clipping_zaxis(cropped_images, sigma = z_axis_clip)  
+            cropped_images = sigma_clipping_zaxis(cropped_images, sigma=z_axis_clip)
         header = merge_headers(header, header_tmp)
-        
+
         # Apply full 3D sigma clipping if threshold is specified
         if clip_threshold > 0:
-            cropped_images, clip_part_images = sigma_clip_3d_nonzero(cropped_images, low_sigma=clip_threshold, high_sigma=clip_threshold)
+            cropped_images, clip_part_images = sigma_clip_3d_nonzero(
+                cropped_images, low_sigma=clip_threshold, high_sigma=clip_threshold)
         else:
-            cropped_images = cropped_images
             clip_part_images = np.zeros_like(cropped_images)
-            
-        # Optionally reorder or filter frames by MSE similarity to the mean frame
+
+        # Optionally reorder frames by MSE quality
         if mse_select == 1:
-            cropped_images_mock,cropped_clip_mock, mse_values = mse_select_bad_frame(cropped_images,clip_part_images)
-        # Normalize to zero-mean, unit-variance (z-score) over the non-zero region
-        cropped_images_mock, std_val, mean_val = z_score_normalize_3d_stack(cropped_images_mock)
+            cropped_images, clip_part_images, _ = mse_select_bad_frame(cropped_images, clip_part_images)
+
+        # Normalize to zero-mean, unit-variance (z-score) over the non-NaN region
+        cropped_images, std_val, mean_val = z_score_normalize_3d_stack(cropped_images)
 
         # Scale and shift intensities into a stable range for training
-        cropped_images_mock /= scale_factor
-        cropped_images_mock += 1
-        cropped_images_mock[np.isnan(cropped_images_mock)] = 0
-        
+        cropped_images /= scale_factor
+        cropped_images += 1
+        cropped_images[np.isnan(cropped_images)] = 0
+
         # Number of slices in the processed 3D stack
-        num_slices = cropped_images_mock.shape[0]
+        num_slices = cropped_images.shape[0]
         # Build a save name that encodes number of exposures and relative path tag
         new_file_name = f"Nexp_{num_slices}z_{tag}.tif"
         output_file_path = os.path.join(output_path, new_file_name)
         # Save processed 3D stack for training
-        tiff.imwrite(output_file_path, cropped_images_mock)
+        tiff.imwrite(output_file_path, cropped_images.astype(np.float32))
         print(f"Processed and saved: {output_file_path}")
 
 def sanitize_relpath(relpath: str) -> str:
