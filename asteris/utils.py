@@ -758,6 +758,148 @@ def visit_relocater(in_dir, out_dir):
             if target.exists():
                 raise FileExistsError(f"File already exists: {target}")
             shutil.move(str(item), str(target))
+
+
+def group_frames_by_dither(fits_files, hdu_num=0, separation_threshold_arcsec=1.0):
+    """
+    Group FITS frames by dither position.
+
+    Frames at the same dither position share nearly identical sky pointings
+    (within telescope jitter) and are pixel-aligned in detector space,
+    making them directly suitable for ASTERIS without reprojection.
+
+    Grouping uses the sky coordinate of each image centre. Two frames are
+    assigned to the same group when their centres are separated by less than
+    separation_threshold_arcsec. A greedy nearest-neighbour pass is used, so
+    the result is deterministic and order-preserving.
+
+    Args:
+        fits_files (list of str): Paths to FITS files.
+        hdu_num (int): HDU index containing the image and WCS header.
+        separation_threshold_arcsec (float): Maximum angular separation in
+            arcsec between frame centres to be considered the same dither
+            position. 1 arcsec comfortably exceeds JWST guide-star jitter
+            (~10 mas) while being far smaller than any practical dither step.
+
+    Returns:
+        groups (dict[int, list[str]]): Maps group index to the list of file
+            paths that share that dither position, in order of first
+            occurrence.
+    """
+    import astropy.units as u
+
+    threshold = separation_threshold_arcsec * u.arcsec
+    centers = []
+
+    for f in fits_files:
+        with fits.open(f) as hdul:
+            hdr = hdul[hdu_num].header
+            shape = hdul[hdu_num].data.shape
+        # Drop any non-celestial axes (e.g. spectral) before computing centre
+        wcs = WCS(hdr).celestial
+        cx, cy = shape[-1] / 2.0, shape[-2] / 2.0  # (x=col, y=row)
+        centers.append(wcs.pixel_to_world(cx, cy))
+
+    group_id = [-1] * len(fits_files)
+    representatives = []  # one SkyCoord per group
+
+    for i, sky in enumerate(centers):
+        matched = False
+        for g, rep in enumerate(representatives):
+            if sky.separation(rep) < threshold:
+                group_id[i] = g
+                matched = True
+                break
+        if not matched:
+            group_id[i] = len(representatives)
+            representatives.append(sky)
+
+    groups = {}
+    for i, g in enumerate(group_id):
+        groups.setdefault(g, []).append(fits_files[i])
+
+    print(f"[group_frames_by_dither] {len(fits_files)} frames -> "
+          f"{len(representatives)} dither group(s)")
+    for g, paths in sorted(groups.items()):
+        print(f"  Group {g}: {len(paths)} frame(s)")
+
+    return groups
+
+
+def reproject_frames_to_common_grid(fits_files, hdu_num=0,
+                                    output_wcs=None, output_shape=None,
+                                    pixel_scale_arcsec=None,
+                                    method='interp'):
+    """
+    Reproject a list of FITS frames onto a common pixel grid.
+
+    The output WCS is either provided by the caller or computed automatically
+    with find_optimal_celestial_wcs to cover the union of all input
+    footprints at the requested (or native) pixel scale. Pixels outside a
+    frame's coverage are set to 0, consistent with the NaN proxy used
+    throughout ASTERIS.
+
+    The pixel_scale_arcsec parameter can be set smaller than the native pixel
+    scale to produce a supersampled output grid. When used in the ASTERIS
+    workflow, set it to the native scale so that the output frames are
+    pixel-aligned and suitable for ASTERIS denoising; reserve supersampling
+    for a subsequent drizzle step applied to the denoised frames.
+
+    Args:
+        fits_files (list of str): Paths to FITS files to reproject.
+        hdu_num (int): HDU index to read from each file.
+        output_wcs (astropy.wcs.WCS, optional): Target WCS. Computed from the
+            union of all input footprints when None.
+        output_shape (tuple (H, W), optional): Output grid shape. Computed
+            alongside output_wcs when None.
+        pixel_scale_arcsec (float, optional): Output pixel scale in
+            arcsec/pixel. Only used when output_wcs is None; if None the
+            native scale of the input frames is preserved.
+        method (str): Reprojection algorithm. 'interp' uses bilinear
+            interpolation (fast). 'exact' conserves flux (slower, preferred
+            for photometry of faint sources).
+
+    Returns:
+        reprojected (np.ndarray, float32): Shape (N, H, W). Reprojected stack;
+            pixels with no input coverage are 0.
+        footprints (np.ndarray, float32): Shape (N, H, W). Per-frame coverage
+            mask (1 = valid data, 0 = no coverage).
+        output_wcs (astropy.wcs.WCS): Common WCS applied to all frames.
+        output_shape (tuple (H, W)): Shape of the output grid.
+    """
+    try:
+        from reproject import reproject_interp, reproject_exact
+        from reproject.mosaicking import find_optimal_celestial_wcs
+    except ImportError:
+        raise ImportError("reproject is required: pip install reproject")
+    import astropy.units as u
+
+    hduls = [fits.open(f) for f in fits_files]
+    hdus  = [hdul[hdu_num] for hdul in hduls]
+
+    try:
+        if output_wcs is None or output_shape is None:
+            kwargs = {}
+            if pixel_scale_arcsec is not None:
+                kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
+            output_wcs, output_shape = find_optimal_celestial_wcs(hdus, **kwargs)
+
+        reproject_fn = reproject_interp if method == 'interp' else reproject_exact
+        N = len(hdus)
+        reprojected = np.zeros((N, *output_shape), dtype=np.float32)
+        footprints  = np.zeros((N, *output_shape), dtype=np.float32)
+
+        for i, hdu in enumerate(tqdm(hdus, desc='Reprojecting')):
+            result, fp = reproject_fn(hdu, output_wcs, shape_out=output_shape)
+            fp = fp.astype(np.float32)
+            reprojected[i] = np.where(fp > 0, result, 0.0).astype(np.float32)
+            footprints[i]  = fp
+
+    finally:
+        for hdul in hduls:
+            hdul.close()
+
+    return reprojected, footprints, output_wcs, output_shape
             
             
             
