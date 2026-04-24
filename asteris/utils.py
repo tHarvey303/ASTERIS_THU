@@ -872,91 +872,121 @@ def visit_relocater(in_dir, out_dir):
 def group_frames_by_dither(fits_files, hdu_num=0, hdu_names=None,
                            separation_threshold_arcsec=1.0):
     """
-    Group FITS frames by dither position.
+    Group FITS frames (or individual detector chips) by sky position.
 
-    Frames at the same dither position share nearly identical sky pointings
-    (within telescope jitter) and are pixel-aligned in detector space,
-    making them directly suitable for ASTERIS without reprojection.
+    Without hdu_names, each file is treated as a single pointing and files
+    within separation_threshold_arcsec of each other are grouped together.
+    This is appropriate for instruments where one file = one detector.
 
-    Grouping uses the sky coordinate of each file's pointing centre. Two files
-    are assigned to the same group when their centres are separated by less than
-    separation_threshold_arcsec. A greedy nearest-neighbour pass is used, so
-    the result is deterministic and order-preserving.
+    With hdu_names, each science extension is treated as an independent chip
+    with its own sky footprint, and chips from *different files* that observe
+    the same patch of sky are grouped together.  This is the correct behaviour
+    for focal-plane mosaics (e.g. Euclid VIS with 16 detectors per exposure):
+    chip 3 from exposure A will overlap with chip 7 from exposure B, not with
+    chip 3 from exposure B, depending on the dither pattern.
+
+    The threshold should be set to roughly half the chip size so that only
+    chips with genuine overlap are grouped.  For Euclid VIS (chip ~204 arcsec,
+    dither step ~100-200 arcsec) a value of ~120 arcsec works well.
 
     Args:
         fits_files (list of str): Paths to FITS files.
         hdu_num (int): HDU index to use when hdu_names is None.
-        hdu_names (str, optional): If provided, the pointing centre for each
-            file is computed as the mean sky position across all image
-            extensions whose name contains this string (e.g. '.SCI' for
-            multi-detector instruments like Euclid VIS where each chip is a
-            separate extension). When None, hdu_num is used instead.
+        hdu_names (str, optional): Substring matched against extension names to
+            identify science chips (e.g. '.SCI').  When provided the function
+            groups individual chips rather than whole files.
         separation_threshold_arcsec (float): Maximum angular separation in
-            arcsec between pointing centres to be considered the same dither
-            position. 1 arcsec comfortably exceeds JWST guide-star jitter
-            (~10 mas) while being far smaller than any practical dither step.
+            arcsec between chip centres to be considered the same sky group.
 
     Returns:
-        groups (dict[int, list[str]]): Maps group index to the list of file
-            paths that share that dither position, in order of first
-            occurrence.
+        Without hdu_names:
+            dict[int, list[str]]: group index → list of file paths.
+        With hdu_names:
+            dict[int, list[tuple[str, str]]]: group index → list of
+            (filepath, extension_name) pairs, one entry per chip.
+            Pass this directly to reproject_frames_to_common_grid.
     """
     import astropy.units as u
     from astropy.coordinates import SkyCoord
 
     threshold = separation_threshold_arcsec * u.arcsec
-    centers = []
 
-    for f in fits_files:
-        with fits.open(f) as hdul:
-            if hdu_names is not None:
+    if hdu_names is not None:
+        # Build a flat list of (filepath, ext_name, sky_centre) for every chip
+        # across all files, then cluster chips by sky position.
+        chips = []   # (filepath, ext_name, SkyCoord)
+        for f in fits_files:
+            with fits.open(f) as hdul:
                 matching = [hdu for hdu in hdul
                             if hdu_names in hdu.name and hdu.is_image and hdu.size > 0]
                 if not matching:
                     raise ValueError(
                         f"No image HDU with '{hdu_names}' in name found in {f}"
                     )
-                chip_ra, chip_dec = [], []
                 for hdu in matching:
-                    w = WCS(hdu.header).celestial
+                    w  = WCS(hdu.header).celestial
                     nx = hdu.header.get('NAXIS1', 1)
                     ny = hdu.header.get('NAXIS2', 1)
                     sky = w.pixel_to_world(nx / 2.0, ny / 2.0)
-                    chip_ra.append(sky.ra.deg)
-                    chip_dec.append(sky.dec.deg)
-                # Mean across all chips — valid for fields well away from RA=0/360
-                sky = SkyCoord(ra=np.mean(chip_ra) * u.deg,
-                               dec=np.mean(chip_dec) * u.deg)
-            else:
-                hdr   = hdul[hdu_num].header
-                nx    = hdr.get('NAXIS1', hdul[hdu_num].data.shape[-1])
-                ny    = hdr.get('NAXIS2', hdul[hdu_num].data.shape[-2])
-                wcs   = WCS(hdr).celestial
-                sky   = wcs.pixel_to_world(nx / 2.0, ny / 2.0)
-        centers.append(sky)
+                    chips.append((f, hdu.name, sky))
 
-    group_id = [-1] * len(fits_files)
-    representatives = []  # one SkyCoord per group
+        group_id      = [-1] * len(chips)
+        representatives = []
 
-    for i, sky in enumerate(centers):
-        matched = False
-        for g, rep in enumerate(representatives):
-            if sky.separation(rep) < threshold:
-                group_id[i] = g
-                matched = True
-                break
-        if not matched:
-            group_id[i] = len(representatives)
-            representatives.append(sky)
+        for i, (_, _, sky) in enumerate(chips):
+            matched = False
+            for g, rep in enumerate(representatives):
+                if sky.separation(rep) < threshold:
+                    group_id[i] = g
+                    matched = True
+                    break
+            if not matched:
+                group_id[i] = len(representatives)
+                representatives.append(sky)
 
-    groups = {}
-    for i, g in enumerate(group_id):
-        groups.setdefault(g, []).append(fits_files[i])
+        groups: dict = {}
+        for i, g in enumerate(group_id):
+            groups.setdefault(g, []).append((chips[i][0], chips[i][1]))
 
-    print(f"[group_frames_by_dither] {len(fits_files)} frames -> "
-          f"{len(representatives)} dither group(s)")
-    for g, paths in sorted(groups.items()):
-        print(f"  Group {g}: {len(paths)} frame(s)")
+        n_chips = len(chips)
+        print(f"[group_frames_by_dither] {len(fits_files)} files, "
+              f"{n_chips} chips -> {len(representatives)} sky group(s)")
+        for g, items in sorted(groups.items()):
+            print(f"  Group {g}: {len(items)} chip(s)")
+
+    else:
+        # File-level grouping: one sky centre per file.
+        centers = []
+        for f in fits_files:
+            with fits.open(f) as hdul:
+                hdr = hdul[hdu_num].header
+                nx  = hdr.get('NAXIS1', hdul[hdu_num].data.shape[-1])
+                ny  = hdr.get('NAXIS2', hdul[hdu_num].data.shape[-2])
+                wcs = WCS(hdr).celestial
+                centers.append(wcs.pixel_to_world(nx / 2.0, ny / 2.0))
+
+        group_id      = [-1] * len(fits_files)
+        representatives = []
+
+        for i, sky in enumerate(centers):
+            matched = False
+            for g, rep in enumerate(representatives):
+                if sky.separation(rep) < threshold:
+                    group_id[i] = g
+                    matched = True
+                    break
+            if not matched:
+                group_id[i] = len(representatives)
+                representatives.append(sky)
+
+        groups = {}
+        for i, g in enumerate(group_id):
+            groups.setdefault(g, []).append(fits_files[i])
+
+        print(f"[group_frames_by_dither] {len(fits_files)} files -> "
+              f"{len(representatives)} dither group(s)")
+        for g, paths in sorted(groups.items()):
+            print(f"  Group {g}: {len(paths)} file(s)")
 
     return groups
 
@@ -974,17 +1004,23 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
     frame's coverage are set to 0, consistent with the NaN proxy used
     throughout ASTERIS.
 
+    fits_files accepts two forms:
+
+      list[str] — file paths.  Use hdu_num (single extension per file) or
+          hdu_names (all matching extensions per file, e.g. '.SCI') to select
+          which extension(s) to reproject.
+
+      list[tuple[str, str]] — (filepath, extension_name) pairs as returned by
+          group_frames_by_dither when hdu_names is provided.  hdu_num and
+          hdu_names are ignored; each tuple specifies the exact extension to
+          use.  Each unique file is opened only once.
+
     Args:
-        fits_files (list of str): Paths to FITS files to reproject.
-        hdu_num (int): HDU index to read from each file. Ignored when
-            hdu_names is provided.
-        hdu_names (str, optional): If provided, every image extension whose
-            name contains this string is reprojected from each file (e.g.
-            '.SCI' for Euclid VIS multi-detector FITS where each chip occupies
-            its own extension). The output array has shape
-            (sum_of_matching_hdus_across_all_files, H, W) and the common WCS
-            is computed to cover the full focal-plane mosaic. When None, a
-            single extension per file (hdu_num) is used.
+        fits_files: list[str] or list[tuple[str, str]] as described above.
+        hdu_num (int): Extension index. Used only with list[str] input when
+            hdu_names is None.
+        hdu_names (str, optional): Extension name substring. Used only with
+            list[str] input to select multiple extensions per file.
         output_wcs (astropy.wcs.WCS, optional): Target WCS. Computed from the
             union of all input footprints when None.
         output_shape (tuple (H, W), optional): Output grid shape. Computed
@@ -992,16 +1028,13 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
         pixel_scale_arcsec (float, optional): Output pixel scale in
             arcsec/pixel. Only used when output_wcs is None; if None the
             native scale of the input frames is preserved.
-        method (str): Reprojection algorithm. 'interp' uses bilinear
-            interpolation (fast). 'exact' conserves flux (slower, preferred
-            for photometry of faint sources).
+        method (str): 'interp' (fast bilinear) or 'exact' (flux-conserving).
 
     Returns:
-        reprojected (np.ndarray, float32): Shape (N, H, W). Reprojected stack;
-            pixels with no input coverage are 0.
-        footprints (np.ndarray, float32): Shape (N, H, W). Per-frame coverage
-            mask (1 = valid data, 0 = no coverage).
-        output_wcs (astropy.wcs.WCS): Common WCS applied to all frames.
+        reprojected (np.ndarray, float32): Shape (N, H, W). Uncovered pixels
+            are 0.
+        footprints (np.ndarray, float32): Shape (N, H, W). Coverage mask.
+        output_wcs (astropy.wcs.WCS): Common WCS used for all frames.
         output_shape (tuple (H, W)): Shape of the output grid.
     """
     try:
@@ -1011,21 +1044,29 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
         raise ImportError("reproject is required: pip install reproject")
     import astropy.units as u
 
-    hduls = [fits.open(f) for f in fits_files]
-
+    hduls_to_close = []
     try:
-        if hdu_names is not None:
-            all_hdus = []
-            for hdul in hduls:
-                matching = [hdu for hdu in hdul
-                            if hdu_names in hdu.name and hdu.is_image and hdu.size > 0]
-                if not matching:
-                    raise ValueError(
-                        f"No image HDU with '{hdu_names}' in name found in one of the input files"
-                    )
-                all_hdus.extend(matching)
+        if fits_files and isinstance(fits_files[0], (tuple, list)):
+            # (filepath, ext_name) pairs — open each unique file once
+            unique_paths = list(dict.fromkeys(f for f, _ in fits_files))
+            hduls_map    = {p: fits.open(p) for p in unique_paths}
+            hduls_to_close = list(hduls_map.values())
+            all_hdus = [hduls_map[f][ext_name] for f, ext_name in fits_files]
         else:
-            all_hdus = [hdul[hdu_num] for hdul in hduls]
+            hduls_to_close = [fits.open(f) for f in fits_files]
+            if hdu_names is not None:
+                all_hdus = []
+                for hdul in hduls_to_close:
+                    matching = [hdu for hdu in hdul
+                                if hdu_names in hdu.name and hdu.is_image and hdu.size > 0]
+                    if not matching:
+                        raise ValueError(
+                            f"No image HDU with '{hdu_names}' in name "
+                            f"found in one of the input files"
+                        )
+                    all_hdus.extend(matching)
+            else:
+                all_hdus = [hdul[hdu_num] for hdul in hduls_to_close]
 
         if output_wcs is None or output_shape is None:
             kwargs = {}
@@ -1045,7 +1086,7 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
             footprints[i]  = fp
 
     finally:
-        for hdul in hduls:
+        for hdul in hduls_to_close:
             hdul.close()
 
     return reprojected, footprints, output_wcs, output_shape

@@ -22,11 +22,14 @@ from asteris.train import training_class
 folder   : str = '/cosma7/data/dp276/dc-harv3/work/images/euclid/test/'
 hdu_names: str = '.SCI'   # extension name substring identifying science chips
 
-# Grouping.  Euclid deep-field tiles share the same pointing across dithers;
-# the 16 chips of the focal plane span ~0.5 deg so a threshold of 1000 arcsec
-# puts all files covering the same tile into one group.  Reduce to ~1 arcsec
-# to separate individual dither positions when many repeats exist per dither.
-separation_threshold_arcsec: float = 1000.0
+# Grouping threshold for chip-level sky matching.  Two chips (from different
+# files) are put in the same group when their centres are within this distance.
+# Set to roughly half the chip size so only genuinely overlapping chips are
+# grouped; do NOT use a large value like 1000 arcsec here because that would
+# merge chips covering completely different sky patches into the same group.
+# For Euclid VIS (chip ~204 arcsec, dither step ~100-200 arcsec), 120 arcsec
+# groups chips that have significant overlap across dither positions.
+separation_threshold_arcsec: float = 120.0
 
 # Reprojection.  'interp' is fast; 'exact' conserves flux (much slower).
 reproject_method: str = 'interp'
@@ -121,54 +124,49 @@ def plot_footprints(files: List[str], hdu_names: str, out_path: str = 'footprint
 
 # ── Reproject and save ─────────────────────────────────────────────────────────
 
-def reproject_groups(groups: dict, hdu_names: str,
-                     out_dir: str, method: str = 'interp') -> None:
+def reproject_groups(groups: dict, out_dir: str, method: str = 'interp') -> None:
     """
-    Reproject all science chips from every file in each group onto a shared
-    mosaic WCS, then save each reprojected chip as an individual FITS file.
+    Reproject each sky group onto a shared output WCS and save individual FITS.
 
-    The common WCS for a group is computed from the union of all chip
-    footprints across all files in that group, so it covers the complete
-    focal-plane mosaic.  Each reprojected chip is saved as a PrimaryHDU;
-    make_train_datasets reads these with hdu_num=0.
+    groups is the dict returned by group_frames_by_dither with hdu_names, i.e.
+    dict[int, list[tuple[str, str]]].  Each group contains (filepath, ext_name)
+    pairs for chips that all observe the same patch of sky.  The common WCS for
+    the group is computed from the union of just those chips, so the output is
+    tight around that sky patch rather than the full focal-plane mosaic.
+
+    Each reprojected chip is saved as a PrimaryHDU using a filename that
+    encodes the source file and extension name so provenance is traceable.
+    make_train_datasets reads these files with hdu_num=0.
 
     Output layout:
-        out_dir/group_00/frame_0000.fits
-        out_dir/group_00/frame_0001.fits
+        out_dir/group_0000/vis_exp001_DET3_SCI.fits
+        out_dir/group_0000/vis_exp004_DET7_SCI.fits
         ...
-        out_dir/group_01/frame_0000.fits
-        ...
+        out_dir/group_0001/...
     """
     os.makedirs(out_dir, exist_ok=True)
 
-    for group_id, group_files in groups.items():
-        group_dir = os.path.join(out_dir, f'group_{group_id:02d}')
+    for group_id, chip_pairs in groups.items():
+        group_dir = os.path.join(out_dir, f'group_{group_id:04d}')
         os.makedirs(group_dir, exist_ok=True)
 
-        n_files = len(group_files)
-        print(f"\nGroup {group_id}: reprojecting {n_files} file(s) "
-              f"({hdu_names} extensions each) ...")
+        print(f"\nGroup {group_id}: reprojecting {len(chip_pairs)} chip(s) ...")
 
+        # chip_pairs is list[tuple[str, str]] — pass directly; each unique file
+        # is opened only once inside reproject_frames_to_common_grid.
         reprojected, footprints, output_wcs, output_shape = reproject_frames_to_common_grid(
-            group_files,
-            hdu_names=hdu_names,
+            chip_pairs,
             method=method,
         )
 
-        # reprojected has shape (N_files * N_chips, H, W)
-        n_chips_total = reprojected.shape[0]
-        n_chips_per_file = n_chips_total // n_files
-
-        for i, frame in enumerate(reprojected):
-            file_idx = i // n_chips_per_file
-            chip_idx = i  % n_chips_per_file
-            out_path = os.path.join(group_dir,
-                                    f'frame_{file_idx:04d}_chip_{chip_idx:02d}.fits')
+        for i, (frame, (filepath, ext_name)) in enumerate(zip(reprojected, chip_pairs)):
+            base     = os.path.splitext(os.path.basename(filepath))[0]
+            safe_ext = ext_name.replace('.', '_').strip('_')
+            out_path = os.path.join(group_dir, f'{base}_{safe_ext}.fits')
             hdu = fits.PrimaryHDU(data=frame, header=output_wcs.to_header())
             hdu.writeto(out_path, overwrite=True)
 
-        print(f"  Saved {n_chips_total} frames "
-              f"({n_files} files × {n_chips_per_file} chips) to {group_dir}")
+        print(f"  Saved {len(chip_pairs)} frames to {group_dir}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -188,9 +186,8 @@ if __name__ == '__main__':
         separation_threshold_arcsec=separation_threshold_arcsec,
     )
 
-    # 3. Reproject all chips to a per-group common mosaic grid
-    reproject_groups(groups, hdu_names=hdu_names,
-                     out_dir=reprojected_dir, method=reproject_method)
+    # 3. Reproject each sky group onto a tight common grid for that patch
+    reproject_groups(groups, out_dir=reprojected_dir, method=reproject_method)
 
     # 4. Preprocess reprojected chips into normalised training stacks.
     #    Reprojected frames are PrimaryHDU → hdu_num=0.
