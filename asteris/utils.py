@@ -869,7 +869,8 @@ def visit_relocater(in_dir, out_dir):
             shutil.move(str(item), str(target))
 
 
-def group_frames_by_dither(fits_files, hdu_num=0, separation_threshold_arcsec=1.0):
+def group_frames_by_dither(fits_files, hdu_num=0, hdu_names=None,
+                           separation_threshold_arcsec=1.0):
     """
     Group FITS frames by dither position.
 
@@ -877,16 +878,21 @@ def group_frames_by_dither(fits_files, hdu_num=0, separation_threshold_arcsec=1.
     (within telescope jitter) and are pixel-aligned in detector space,
     making them directly suitable for ASTERIS without reprojection.
 
-    Grouping uses the sky coordinate of each image centre. Two frames are
-    assigned to the same group when their centres are separated by less than
+    Grouping uses the sky coordinate of each file's pointing centre. Two files
+    are assigned to the same group when their centres are separated by less than
     separation_threshold_arcsec. A greedy nearest-neighbour pass is used, so
     the result is deterministic and order-preserving.
 
     Args:
         fits_files (list of str): Paths to FITS files.
-        hdu_num (int): HDU index containing the image and WCS header.
+        hdu_num (int): HDU index to use when hdu_names is None.
+        hdu_names (str, optional): If provided, the pointing centre for each
+            file is computed as the mean sky position across all image
+            extensions whose name contains this string (e.g. '.SCI' for
+            multi-detector instruments like Euclid VIS where each chip is a
+            separate extension). When None, hdu_num is used instead.
         separation_threshold_arcsec (float): Maximum angular separation in
-            arcsec between frame centres to be considered the same dither
+            arcsec between pointing centres to be considered the same dither
             position. 1 arcsec comfortably exceeds JWST guide-star jitter
             (~10 mas) while being far smaller than any practical dither step.
 
@@ -896,18 +902,38 @@ def group_frames_by_dither(fits_files, hdu_num=0, separation_threshold_arcsec=1.
             occurrence.
     """
     import astropy.units as u
+    from astropy.coordinates import SkyCoord
 
     threshold = separation_threshold_arcsec * u.arcsec
     centers = []
 
     for f in fits_files:
         with fits.open(f) as hdul:
-            hdr = hdul[hdu_num].header
-            shape = hdul[hdu_num].data.shape
-        # Drop any non-celestial axes (e.g. spectral) before computing centre
-        wcs = WCS(hdr).celestial
-        cx, cy = shape[-1] / 2.0, shape[-2] / 2.0  # (x=col, y=row)
-        centers.append(wcs.pixel_to_world(cx, cy))
+            if hdu_names is not None:
+                matching = [hdu for hdu in hdul
+                            if hdu_names in hdu.name and hdu.is_image and hdu.size > 0]
+                if not matching:
+                    raise ValueError(
+                        f"No image HDU with '{hdu_names}' in name found in {f}"
+                    )
+                chip_ra, chip_dec = [], []
+                for hdu in matching:
+                    w = WCS(hdu.header).celestial
+                    nx = hdu.header.get('NAXIS1', 1)
+                    ny = hdu.header.get('NAXIS2', 1)
+                    sky = w.pixel_to_world(nx / 2.0, ny / 2.0)
+                    chip_ra.append(sky.ra.deg)
+                    chip_dec.append(sky.dec.deg)
+                # Mean across all chips — valid for fields well away from RA=0/360
+                sky = SkyCoord(ra=np.mean(chip_ra) * u.deg,
+                               dec=np.mean(chip_dec) * u.deg)
+            else:
+                hdr   = hdul[hdu_num].header
+                nx    = hdr.get('NAXIS1', hdul[hdu_num].data.shape[-1])
+                ny    = hdr.get('NAXIS2', hdul[hdu_num].data.shape[-2])
+                wcs   = WCS(hdr).celestial
+                sky   = wcs.pixel_to_world(nx / 2.0, ny / 2.0)
+        centers.append(sky)
 
     group_id = [-1] * len(fits_files)
     representatives = []  # one SkyCoord per group
@@ -935,7 +961,7 @@ def group_frames_by_dither(fits_files, hdu_num=0, separation_threshold_arcsec=1.
     return groups
 
 
-def reproject_frames_to_common_grid(fits_files, hdu_num=0,
+def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
                                     output_wcs=None, output_shape=None,
                                     pixel_scale_arcsec=None,
                                     method='interp'):
@@ -948,15 +974,17 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0,
     frame's coverage are set to 0, consistent with the NaN proxy used
     throughout ASTERIS.
 
-    The pixel_scale_arcsec parameter can be set smaller than the native pixel
-    scale to produce a supersampled output grid. When used in the ASTERIS
-    workflow, set it to the native scale so that the output frames are
-    pixel-aligned and suitable for ASTERIS denoising; reserve supersampling
-    for a subsequent drizzle step applied to the denoised frames.
-
     Args:
         fits_files (list of str): Paths to FITS files to reproject.
-        hdu_num (int): HDU index to read from each file.
+        hdu_num (int): HDU index to read from each file. Ignored when
+            hdu_names is provided.
+        hdu_names (str, optional): If provided, every image extension whose
+            name contains this string is reprojected from each file (e.g.
+            '.SCI' for Euclid VIS multi-detector FITS where each chip occupies
+            its own extension). The output array has shape
+            (sum_of_matching_hdus_across_all_files, H, W) and the common WCS
+            is computed to cover the full focal-plane mosaic. When None, a
+            single extension per file (hdu_num) is used.
         output_wcs (astropy.wcs.WCS, optional): Target WCS. Computed from the
             union of all input footprints when None.
         output_shape (tuple (H, W), optional): Output grid shape. Computed
@@ -984,21 +1012,33 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0,
     import astropy.units as u
 
     hduls = [fits.open(f) for f in fits_files]
-    hdus  = [hdul[hdu_num] for hdul in hduls]
 
     try:
+        if hdu_names is not None:
+            all_hdus = []
+            for hdul in hduls:
+                matching = [hdu for hdu in hdul
+                            if hdu_names in hdu.name and hdu.is_image and hdu.size > 0]
+                if not matching:
+                    raise ValueError(
+                        f"No image HDU with '{hdu_names}' in name found in one of the input files"
+                    )
+                all_hdus.extend(matching)
+        else:
+            all_hdus = [hdul[hdu_num] for hdul in hduls]
+
         if output_wcs is None or output_shape is None:
             kwargs = {}
             if pixel_scale_arcsec is not None:
                 kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
-            output_wcs, output_shape = find_optimal_celestial_wcs(hdus, **kwargs)
+            output_wcs, output_shape = find_optimal_celestial_wcs(all_hdus, **kwargs)
 
         reproject_fn = reproject_interp if method == 'interp' else reproject_exact
-        N = len(hdus)
+        N = len(all_hdus)
         reprojected = np.zeros((N, *output_shape), dtype=np.float32)
         footprints  = np.zeros((N, *output_shape), dtype=np.float32)
 
-        for i, hdu in enumerate(tqdm(hdus, desc='Reprojecting')):
+        for i, hdu in enumerate(tqdm(all_hdus, desc='Reprojecting')):
             result, fp = reproject_fn(hdu, output_wcs, shape_out=output_shape)
             fp = fp.astype(np.float32)
             reprojected[i] = np.where(fp > 0, result, 0.0).astype(np.float32)
