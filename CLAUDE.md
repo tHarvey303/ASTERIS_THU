@@ -111,15 +111,19 @@ Training uses [SwanLab](https://swanlab.cn) for real-time loss visualization. Lo
 
 ### Frame alignment utilities (`utils.py`)
 
-Two functions support the workflow of combining ASTERIS with drizzle-based supersampling:
+Three functions support Euclid-style multi-extension FITS and drizzle workflows:
 
-**`group_frames_by_dither(fits_files, hdu_num, separation_threshold_arcsec)`** — clusters FITS files by their sky pointing centre. Frames in the same group are pixel-aligned in detector space (same dither position, separated only by telescope jitter) and can be fed directly to ASTERIS without reprojection. Uses greedy nearest-neighbour clustering on WCS-derived sky coordinates; returns `dict[int, list[str]]`.
+**`make_train_datasets_from_raw(...)`** — preferred pipeline for multi-detector instruments (e.g. Euclid VIS with 16 chips per exposure). Computes a single global WCS covering all input chips, then steps over it in `patch_xy`-sized strides. For each position a bounding-box pre-filter identifies candidate chips; only those are reprojected into the small `(patch_xy × patch_xy)` patch grid. Positions with fewer than `min_coverage` valid frames are skipped. Valid patches are sigma-clipped, z-score normalised and saved as individual `.tif` files that `training_class` consumes without modification (the spatial patch loop in `train_preprocess` degenerates to one position per file when H = W = `patch_xy`). No large intermediate reprojected files are written and no grouping threshold needs tuning. Use `euclid_direct_pipeline.py`.
 
-**`reproject_frames_to_common_grid(fits_files, hdu_num, output_wcs, output_shape, pixel_scale_arcsec, method)`** — reprojects all input frames onto a shared pixel grid using the `reproject` package (`pip install reproject`). The common WCS is computed automatically with `find_optimal_celestial_wcs` when not supplied. `method='interp'` is fast; `method='exact'` conserves flux. Uncovered pixels are set to 0. Returns `(reprojected, footprints, output_wcs, output_shape)`.
+Key parameters: `min_coverage` (= `patch_t * 2`); `min_frame_coverage` (fraction of patch pixels a chip must cover to count — increase to 0.7–0.9 to avoid zero-heavy frames that fail the training 20% filter); `hdu_names` (e.g. `'.SCI'`).
 
-The intended combined workflow when multiple repeats exist at each dither position:
-1. `group_frames_by_dither` → separate groups, each pixel-aligned in detector space
+**`group_frames_by_dither(fits_files, hdu_names, separation_threshold_arcsec)`** — clusters chips by sky centre. With `hdu_names` provided, clusters individual HDU-level chips across files (correct for focal-plane mosaics: chip 3 from exposure A overlaps chip 7 from exposure B, not chip 3 from exposure B). Returns `dict[int, list[tuple[str,str]]]` of `(filepath, ext_name)` pairs. Used by `euclid_multiext_pipeline.py`; superseded by `make_train_datasets_from_raw` for most cases.
+
+**`reproject_frames_to_common_grid(fits_files, ...)`** — reprojects frames onto a shared pixel grid. Accepts either `list[str]` or `list[tuple[str,str]]` (from `group_frames_by_dither`). `method='interp'` is fast; `method='exact'` conserves flux. Returns `(reprojected, footprints, output_wcs, output_shape)`.
+
+The drizzle+ASTERIS combined workflow (when multiple repeats exist per dither):
+1. `group_frames_by_dither` → per-dither groups, pixel-aligned in detector space
 2. ASTERIS on each group → one denoised frame per dither position
 3. Drizzle across denoised per-dither frames → supersampled mosaic
 
-When only one frame exists per dither, reproject all frames to a common native-scale grid with `reproject_frames_to_common_grid`, run ASTERIS, then mean-combine — supersampling is not recoverable at this point.
+When only one frame exists per dither: use `make_train_datasets_from_raw` to reproject and train on all frames together, then mean-combine results — supersampling is not recoverable.

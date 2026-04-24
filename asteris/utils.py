@@ -991,6 +991,250 @@ def group_frames_by_dither(fits_files, hdu_num=0, hdu_names=None,
     return groups
 
 
+def make_train_datasets_from_raw(
+    fits_files,
+    output_path,
+    patch_xy=128,
+    overlap_factor=0.1,
+    min_coverage=16,
+    min_frame_coverage=0.5,
+    scale_factor=4.0,
+    mse_select=1,
+    z_axis_clip=3.0,
+    clip_threshold=3.0,
+    method='interp',
+    pixel_scale_arcsec=None,
+    hdu_names=None,
+    hdu_num=0,
+):
+    """
+    Build normalised training patches directly from raw FITS files in one pass.
+
+    Computes a global WCS covering all input chips, then steps over it in
+    patch-sized strides.  For each candidate position a cheap bounding-box
+    pre-filter identifies which chips overlap; only those chips are reprojected
+    into the small (patch_xy × patch_xy) patch grid.  Positions with fewer
+    than min_coverage valid frames are skipped.  Valid patches are
+    sigma-clipped, z-score normalised and saved as individual .tif files that
+    the existing training_class can consume without modification.
+
+    Compared with the group → reproject → make_train_datasets pipeline this
+    approach:
+      - Requires no large intermediate reprojected images on disk.
+      - Does not need a carefully-tuned grouping-threshold parameter.
+      - Naturally handles overlapping chips from different detectors and
+        dither positions (e.g. Euclid VIS with 16 chips per exposure).
+      - Only reprojects pixels that actually become training samples.
+
+    Each output .tif file has shape (N_frames, patch_xy, patch_xy) and is
+    compatible with training_class.train_preprocess() — the spatial patch loop
+    there degenerates to a single position when H == W == patch_xy, so no
+    change to the training code is required.
+
+    Args:
+        fits_files (list[str]): Input FITS file paths.
+        output_path (str): Directory for output .tif patch files.
+        patch_xy (int): Spatial patch size in pixels (H and W).
+        overlap_factor (float): Fraction of patch_xy by which adjacent patches
+            overlap. Stride = int(patch_xy * (1 - overlap_factor)).
+        min_coverage (int): Minimum number of frames that must provide valid
+            data in a patch for it to be saved.  Set to patch_t * 2 — i.e. 8
+            for ASTERIS4 or 16 for ASTERIS8.
+        min_frame_coverage (float): A reprojected frame must cover at least
+            this fraction of patch pixels (non-zero reprojection footprint) to
+            count toward min_coverage.  Increase toward 0.8–0.9 to reduce
+            zero-heavy frames and avoid training filter rejection.
+        scale_factor (float): Divisor applied after z-score normalisation.
+        mse_select (int): If 1, sort frames by ascending MSE before saving so
+            the best frames are at even indices (used as training input).
+        z_axis_clip (float): Per-pixel temporal sigma-clip threshold; 0 = off.
+        clip_threshold (float): Global 3D sigma-clip threshold; 0 = off.
+        method (str): Reprojection method — 'interp' (fast bilinear) or
+            'exact' (flux-conserving, much slower).
+        pixel_scale_arcsec (float, optional): Output pixel scale in
+            arcsec/pixel.  Native scale of the inputs when None.
+        hdu_names (str, optional): Substring matched against HDU extension
+            names to select science chips (e.g. '.SCI').  Each matching
+            extension in every file is treated as an independent chip.
+            When None, hdu_num selects a single extension per file.
+        hdu_num (int): Extension index; used only when hdu_names is None.
+    """
+    try:
+        from reproject import reproject_interp, reproject_exact
+        from reproject.mosaicking import find_optimal_celestial_wcs
+    except ImportError:
+        raise ImportError("reproject is required: pip install reproject")
+    import astropy.units as u
+
+    os.makedirs(output_path, exist_ok=True)
+    reproject_fn = reproject_interp if method == 'interp' else reproject_exact
+
+    # ── Phase 1: Open all files; collect chip HDUs and WCS metadata ───────────
+    print("[make_train_datasets_from_raw] Opening files and collecting chips ...")
+    chips = []      # list of dicts: hdu, wcs, nx, ny  (populated below)
+    hduls = {}      # filepath → open HDUList (kept open via memmap for lazy I/O)
+
+    for f in fits_files:
+        hdul = fits.open(f, memmap=True)
+        hduls[f] = hdul
+        if hdu_names is not None:
+            for hdu in hdul:
+                if hdu_names in hdu.name and hdu.is_image and hdu.size > 0:
+                    w  = WCS(hdu.header).celestial
+                    nx = hdu.header.get('NAXIS1', 1)
+                    ny = hdu.header.get('NAXIS2', 1)
+                    chips.append({'hdu': hdu, 'wcs': w, 'nx': nx, 'ny': ny})
+        else:
+            hdu = hdul[hdu_num]
+            w  = WCS(hdu.header).celestial
+            nx = hdu.header.get('NAXIS1', hdu.data.shape[-1])
+            ny = hdu.header.get('NAXIS2', hdu.data.shape[-2])
+            chips.append({'hdu': hdu, 'wcs': w, 'nx': nx, 'ny': ny})
+
+    n_chips = len(chips)
+    print(f"  {len(fits_files)} file(s) → {n_chips} chip(s)")
+
+    if n_chips < min_coverage:
+        for hdul in hduls.values():
+            hdul.close()
+        raise ValueError(
+            f"Only {n_chips} chips found but min_coverage={min_coverage}. "
+            "Not enough frames to produce any training patches."
+        )
+
+    # ── Phase 2: Global WCS covering the union of all chip footprints ─────────
+    print("Computing global WCS ...")
+    wcs_kwargs = {}
+    if pixel_scale_arcsec is not None:
+        wcs_kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
+    global_wcs, global_shape = find_optimal_celestial_wcs(
+        [c['hdu'] for c in chips], **wcs_kwargs
+    )
+    H_global, W_global = global_shape
+    print(f"  Global grid: {H_global} × {W_global} pixels")
+
+    # ── Phase 3: Chip bounding boxes in global 0-indexed pixel coordinates ────
+    # world_to_pixel_values returns 0-indexed (x_col, y_row) coordinates.
+    for chip in chips:
+        corners = chip['wcs'].calc_footprint(axes=(chip['nx'], chip['ny']))  # (4,2) RA,Dec
+        px, py = global_wcs.world_to_pixel_values(corners[:, 0], corners[:, 1])
+        chip['bbox'] = (float(px.min()), float(px.max()),
+                        float(py.min()), float(py.max()))
+
+    # ── Phase 4: Step over the global grid ────────────────────────────────────
+    stride = int(patch_xy * (1 - overlap_factor))
+
+    def _positions(total, patch, step):
+        """Start indices covering [0, total) with patch-sized windows."""
+        if total < patch:
+            return []
+        pos = list(range(0, total - patch + 1, step))
+        if pos[-1] + patch < total:
+            pos.append(total - patch)
+        return pos
+
+    x_positions = _positions(W_global, patch_xy, stride)
+    y_positions = _positions(H_global, patch_xy, stride)
+    total_cands = len(x_positions) * len(y_positions)
+    print(f"  Stride {stride} px → {len(y_positions)} × {len(x_positions)} "
+          f"= {total_cands} candidate positions")
+
+    saved = skipped_bbox = skipped_cov = 0
+
+    try:
+        for y0 in tqdm(y_positions, desc='Scanning rows'):
+            for x0 in x_positions:
+
+                # ── Bounding-box pre-filter (O(n_chips), no I/O) ──────────────
+                px_lo, px_hi = float(x0),           float(x0 + patch_xy)
+                py_lo, py_hi = float(y0),           float(y0 + patch_xy)
+
+                candidates = [
+                    c for c in chips
+                    if (c['bbox'][0] < px_hi and c['bbox'][1] > px_lo and
+                        c['bbox'][2] < py_hi and c['bbox'][3] > py_lo)
+                ]
+                if len(candidates) < min_coverage:
+                    skipped_bbox += 1
+                    continue
+
+                # ── Local WCS for this patch ───────────────────────────────────
+                # Shifting CRPIX by the 0-indexed offset maps global FITS pixel
+                # (x0+1, y0+1) to patch FITS pixel (1, 1).  Valid for any
+                # distortion-free TAN projection (which find_optimal_celestial_wcs
+                # always produces).
+                patch_wcs = global_wcs.deepcopy()
+                patch_wcs.wcs.crpix[0] -= x0
+                patch_wcs.wcs.crpix[1] -= y0
+                patch_wcs.wcs.set()
+
+                # ── Reproject each candidate into the patch grid ───────────────
+                N = len(candidates)
+                patch_stack = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
+                fp_stack    = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
+
+                for i, chip in enumerate(candidates):
+                    result, fp = reproject_fn(
+                        chip['hdu'], patch_wcs,
+                        shape_out=(patch_xy, patch_xy),
+                    )
+                    fp32 = fp.astype(np.float32)
+                    patch_stack[i] = np.where(fp32 > 0, result, 0.0).astype(np.float32)
+                    fp_stack[i]    = fp32
+
+                # ── Coverage gate: drop frames with thin footprint ─────────────
+                cov_frac  = fp_stack.mean(axis=(1, 2))           # (N,)
+                valid_idx = np.where(cov_frac >= min_frame_coverage)[0]
+
+                if len(valid_idx) < min_coverage:
+                    skipped_cov += 1
+                    continue
+
+                stack = patch_stack[valid_idx].copy()  # (N_valid, H, W)
+
+                # ── Preprocessing (mirrors make_train_datasets) ────────────────
+                stack[stack == 0] = np.nan
+
+                if z_axis_clip > 0:
+                    stack = sigma_clipping_zaxis(stack, sigma=z_axis_clip)
+
+                if clip_threshold > 0:
+                    stack, clip_part = sigma_clip_3d_nonzero(
+                        stack,
+                        low_sigma=clip_threshold,
+                        high_sigma=clip_threshold,
+                    )
+                else:
+                    clip_part = np.zeros_like(stack)
+
+                if mse_select == 1:
+                    stack, clip_part, _ = mse_select_bad_frame(stack, clip_part)
+
+                stack, _std, _mean = z_score_normalize_3d_stack(stack)
+                stack /= scale_factor
+                stack += 1
+                stack[np.isnan(stack)] = 0
+
+                # ── Save ───────────────────────────────────────────────────────
+                n_frames = stack.shape[0]
+                fname = f"patch_y{y0:05d}_x{x0:05d}_N{n_frames:03d}.tif"
+                tiff.imwrite(
+                    os.path.join(output_path, fname),
+                    stack.astype(np.float32),
+                )
+                saved += 1
+
+    finally:
+        for hdul in hduls.values():
+            hdul.close()
+
+    print(f"\n[make_train_datasets_from_raw] Complete.")
+    print(f"  Saved:              {saved}")
+    print(f"  Skipped (bbox):     {skipped_bbox}")
+    print(f"  Skipped (coverage): {skipped_cov}")
+    return saved
+
+
 def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
                                     output_wcs=None, output_shape=None,
                                     pixel_scale_arcsec=None,
