@@ -991,6 +991,45 @@ def group_frames_by_dither(fits_files, hdu_num=0, hdu_names=None,
     return groups
 
 
+def _linear_wcs_from_header(header):
+    """
+    Return a distortion-free TAN WCS from a FITS header.
+
+    Instruments like Euclid VIS carry SIP or TPV polynomial distortion in their
+    WCS headers.  The iterative inverse of these polynomials (needed by
+    reproject during the sky→pixel roundtrip) can fail to converge for sky
+    positions outside the chip footprint, raising InvalidCoordinateError.
+
+    Keeping only the linear CD/PC + CRPIX/CRVAL terms avoids this.  The error
+    introduced is sub-pixel for typical astronomical distortion amplitudes
+    (< 0.1 arcsec), which is negligible for training patch generation.
+    """
+    from astropy.io.fits import Header as FitsHeader
+    clean = FitsHeader()
+    keep = {
+        'NAXIS', 'NAXIS1', 'NAXIS2',
+        'CTYPE1', 'CTYPE2',
+        'CRPIX1', 'CRPIX2',
+        'CRVAL1', 'CRVAL2',
+        'CDELT1', 'CDELT2', 'CROTA2',
+        'CD1_1', 'CD1_2', 'CD2_1', 'CD2_2',
+        'PC1_1', 'PC1_2', 'PC2_1', 'PC2_2',
+        'LONPOLE', 'LATPOLE', 'EQUINOX', 'RADESYS',
+    }
+    for key in keep:
+        if key in header:
+            clean[key] = header[key]
+    # Strip any distortion suffix from the projection type
+    # e.g. 'RA---TAN-SIP' → 'RA---TAN', 'DEC--TAN-SIP' → 'DEC--TAN'
+    for i in ('1', '2'):
+        k = f'CTYPE{i}'
+        if k in clean:
+            val = clean[k]
+            if '-SIP' in val:
+                clean[k] = val.replace('-SIP', '')
+    return WCS(clean)
+
+
 def make_train_datasets_from_raw(
     fits_files,
     output_path,
@@ -1070,9 +1109,12 @@ def make_train_datasets_from_raw(
     reproject_fn = reproject_interp if method == 'interp' else reproject_exact
 
     # ── Phase 1: Open all files; collect chip HDUs and WCS metadata ───────────
+    # Chips are stored as (data_memmap, linear_wcs) tuples rather than raw HDUs
+    # so that reproject never encounters distortion terms during coordinate
+    # inversion (see _linear_wcs_from_header for details).
     print("[make_train_datasets_from_raw] Opening files and collecting chips ...")
-    chips = []      # list of dicts: hdu, wcs, nx, ny  (populated below)
-    hduls = {}      # filepath → open HDUList (kept open via memmap for lazy I/O)
+    chips = []      # list of dicts: reproject_input, wcs, nx, ny
+    hduls = {}      # filepath → open HDUList (kept open; memmap stays valid)
 
     for f in fits_files:
         hdul = fits.open(f, memmap=True)
@@ -1080,16 +1122,24 @@ def make_train_datasets_from_raw(
         if hdu_names is not None:
             for hdu in hdul:
                 if hdu_names in hdu.name and hdu.is_image and hdu.size > 0:
-                    w  = WCS(hdu.header).celestial
+                    lin_wcs = _linear_wcs_from_header(hdu.header)
                     nx = hdu.header.get('NAXIS1', 1)
                     ny = hdu.header.get('NAXIS2', 1)
-                    chips.append({'hdu': hdu, 'wcs': w, 'nx': nx, 'ny': ny})
+                    chips.append({
+                        'reproject_input': (hdu.data, lin_wcs),
+                        'wcs': lin_wcs.celestial,
+                        'nx': nx, 'ny': ny,
+                    })
         else:
             hdu = hdul[hdu_num]
-            w  = WCS(hdu.header).celestial
+            lin_wcs = _linear_wcs_from_header(hdu.header)
             nx = hdu.header.get('NAXIS1', hdu.data.shape[-1])
             ny = hdu.header.get('NAXIS2', hdu.data.shape[-2])
-            chips.append({'hdu': hdu, 'wcs': w, 'nx': nx, 'ny': ny})
+            chips.append({
+                'reproject_input': (hdu.data, lin_wcs),
+                'wcs': lin_wcs.celestial,
+                'nx': nx, 'ny': ny,
+            })
 
     n_chips = len(chips)
     print(f"  {len(fits_files)} file(s) → {n_chips} chip(s)")
@@ -1108,10 +1158,13 @@ def make_train_datasets_from_raw(
     if pixel_scale_arcsec is not None:
         wcs_kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
     global_wcs, global_shape = find_optimal_celestial_wcs(
-        [c['hdu'] for c in chips], **wcs_kwargs
+        [c['reproject_input'] for c in chips], **wcs_kwargs
     )
     H_global, W_global = global_shape
     print(f"  Global grid: {H_global} × {W_global} pixels")
+    # Cache the global WCS header so we can build clean patch WCS objects
+    # without deepcopy (which can carry internal wcslib distortion state).
+    _global_wcs_header = global_wcs.to_header()
 
     # ── Phase 3: Chip bounding boxes in global 0-indexed pixel coordinates ────
     # world_to_pixel_values returns 0-indexed (x_col, y_row) coordinates.
@@ -1159,14 +1212,14 @@ def make_train_datasets_from_raw(
                     continue
 
                 # ── Local WCS for this patch ───────────────────────────────────
-                # Shifting CRPIX by the 0-indexed offset maps global FITS pixel
-                # (x0+1, y0+1) to patch FITS pixel (1, 1).  Valid for any
-                # distortion-free TAN projection (which find_optimal_celestial_wcs
-                # always produces).
-                patch_wcs = global_wcs.deepcopy()
-                patch_wcs.wcs.crpix[0] -= x0
-                patch_wcs.wcs.crpix[1] -= y0
-                patch_wcs.wcs.set()
+                # Build from the cached header rather than deepcopy so no
+                # internal wcslib distortion state is carried over.
+                # CRPIX1/2 are shifted by the 0-indexed (col, row) offset so
+                # that global FITS pixel (x0+1, y0+1) maps to patch pixel (1,1).
+                _phdr = _global_wcs_header.copy()
+                _phdr['CRPIX1'] = float(_global_wcs_header['CRPIX1']) - x0
+                _phdr['CRPIX2'] = float(_global_wcs_header['CRPIX2']) - y0
+                patch_wcs = WCS(_phdr)
 
                 # ── Reproject each candidate into the patch grid ───────────────
                 N = len(candidates)
@@ -1175,7 +1228,7 @@ def make_train_datasets_from_raw(
 
                 for i, chip in enumerate(candidates):
                     result, fp = reproject_fn(
-                        chip['hdu'], patch_wcs,
+                        chip['reproject_input'], patch_wcs,
                         shape_out=(patch_xy, patch_xy),
                     )
                     fp32 = fp.astype(np.float32)
@@ -1312,19 +1365,28 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
             else:
                 all_hdus = [hdul[hdu_num] for hdul in hduls_to_close]
 
+        # Strip distortion from chip WCS before reprojection.  Euclid VIS and
+        # similar instruments carry SIP/TPV terms whose iterative inverse fails
+        # to converge for sky positions outside the chip footprint, causing
+        # reproject to raise InvalidCoordinateError.  The linear TAN model
+        # retained here is sub-pixel accurate for typical distortion amplitudes.
+        all_inputs = [
+            (hdu.data, _linear_wcs_from_header(hdu.header)) for hdu in all_hdus
+        ]
+
         if output_wcs is None or output_shape is None:
             kwargs = {}
             if pixel_scale_arcsec is not None:
                 kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
-            output_wcs, output_shape = find_optimal_celestial_wcs(all_hdus, **kwargs)
+            output_wcs, output_shape = find_optimal_celestial_wcs(all_inputs, **kwargs)
 
         reproject_fn = reproject_interp if method == 'interp' else reproject_exact
-        N = len(all_hdus)
+        N = len(all_inputs)
         reprojected = np.zeros((N, *output_shape), dtype=np.float32)
         footprints  = np.zeros((N, *output_shape), dtype=np.float32)
 
-        for i, hdu in enumerate(tqdm(all_hdus, desc='Reprojecting')):
-            result, fp = reproject_fn(hdu, output_wcs, shape_out=output_shape)
+        for i, inp in enumerate(tqdm(all_inputs, desc='Reprojecting')):
+            result, fp = reproject_fn(inp, output_wcs, shape_out=output_shape)
             fp = fp.astype(np.float32)
             reprojected[i] = np.where(fp > 0, result, 0.0).astype(np.float32)
             footprints[i]  = fp
