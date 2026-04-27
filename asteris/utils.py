@@ -1109,11 +1109,17 @@ def make_train_datasets_from_raw(
     reproject_fn = reproject_interp if method == 'interp' else reproject_exact
 
     # ── Phase 1: Open all files; collect chip HDUs and WCS metadata ───────────
-    # Chips are stored as (data_memmap, linear_wcs) tuples rather than raw HDUs
-    # so that reproject never encounters distortion terms during coordinate
-    # inversion (see _linear_wcs_from_header for details).
+    # Each chip stores:
+    #   hdu            — original HDU; used for find_optimal_celestial_wcs
+    #                    (only needs the forward WCS pixel→sky, which is fine
+    #                    even for distorted chips).
+    #   reproject_input — (data_memmap, linear_wcs); used for reproject_interp /
+    #                    reproject_exact.  The linear WCS avoids the iterative
+    #                    inverse-distortion call that fails outside chip bounds
+    #                    (see _linear_wcs_from_header for details).
+    #   wcs            — linear celestial WCS; used only for bbox pre-filtering.
     print("[make_train_datasets_from_raw] Opening files and collecting chips ...")
-    chips = []      # list of dicts: reproject_input, wcs, nx, ny
+    chips = []      # list of dicts per chip
     hduls = {}      # filepath → open HDUList (kept open; memmap stays valid)
 
     for f in fits_files:
@@ -1126,8 +1132,9 @@ def make_train_datasets_from_raw(
                     nx = hdu.header.get('NAXIS1', 1)
                     ny = hdu.header.get('NAXIS2', 1)
                     chips.append({
+                        'hdu'            : hdu,
                         'reproject_input': (hdu.data, lin_wcs),
-                        'wcs': lin_wcs.celestial,
+                        'wcs'            : lin_wcs.celestial,
                         'nx': nx, 'ny': ny,
                     })
         else:
@@ -1136,8 +1143,9 @@ def make_train_datasets_from_raw(
             nx = hdu.header.get('NAXIS1', hdu.data.shape[-1])
             ny = hdu.header.get('NAXIS2', hdu.data.shape[-2])
             chips.append({
+                'hdu'            : hdu,
                 'reproject_input': (hdu.data, lin_wcs),
-                'wcs': lin_wcs.celestial,
+                'wcs'            : lin_wcs.celestial,
                 'nx': nx, 'ny': ny,
             })
 
@@ -1158,7 +1166,7 @@ def make_train_datasets_from_raw(
     if pixel_scale_arcsec is not None:
         wcs_kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
     global_wcs, global_shape = find_optimal_celestial_wcs(
-        [c['reproject_input'] for c in chips], **wcs_kwargs
+        [c['hdu'] for c in chips], **wcs_kwargs
     )
     H_global, W_global = global_shape
     print(f"  Global grid: {H_global} × {W_global} pixels")
@@ -1365,11 +1373,13 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
             else:
                 all_hdus = [hdul[hdu_num] for hdul in hduls_to_close]
 
-        # Strip distortion from chip WCS before reprojection.  Euclid VIS and
-        # similar instruments carry SIP/TPV terms whose iterative inverse fails
-        # to converge for sky positions outside the chip footprint, causing
-        # reproject to raise InvalidCoordinateError.  The linear TAN model
-        # retained here is sub-pixel accurate for typical distortion amplitudes.
+        # Build (data, linear_wcs) tuples for the actual reproject calls.
+        # The original HDUs are still used for find_optimal_celestial_wcs so
+        # that the output grid covers the correct footprint — forward WCS
+        # (pixel→sky) works fine even for distorted chips.  Only the inverse
+        # (sky→pixel, needed by reproject during roundtrip verification) fails
+        # outside the chip footprint; stripping distortion from the reprojection
+        # WCS avoids this with sub-pixel accuracy.
         all_inputs = [
             (hdu.data, _linear_wcs_from_header(hdu.header)) for hdu in all_hdus
         ]
@@ -1378,7 +1388,7 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
             kwargs = {}
             if pixel_scale_arcsec is not None:
                 kwargs['resolution'] = pixel_scale_arcsec * u.arcsec
-            output_wcs, output_shape = find_optimal_celestial_wcs(all_inputs, **kwargs)
+            output_wcs, output_shape = find_optimal_celestial_wcs(all_hdus, **kwargs)
 
         reproject_fn = reproject_interp if method == 'interp' else reproject_exact
         N = len(all_inputs)
