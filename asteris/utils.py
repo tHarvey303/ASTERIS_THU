@@ -1293,7 +1293,6 @@ def make_train_datasets_from_raw(
     for f in fits_files:
         hdul = fits.open(f, memmap=True)
         hduls[f] = hdul
-        print(hdul.info())
         if hdu_names is not None:
             for hdu in hdul:
                 if hdu_names in hdu.name and hdu.is_image and hdu.size > 0:
@@ -1314,8 +1313,8 @@ def make_train_datasets_from_raw(
                         'wcs'            : cel_wcs,
                         'nx': nx, 'ny': ny,
                     })
-                else:
-                    print(f"{os.path.basename(f)} [{hdu.name}]: skipping non-matching HDU.")
+                #else:
+                #    print(f"{os.path.basename(f)} [{hdu.name}]: skipping non-matching HDU.")
         else:
             hdu = hdul[hdu_num]
             lin_wcs = _linear_wcs_from_header(hdu.header)
