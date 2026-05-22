@@ -1100,6 +1100,8 @@ def _linear_wcs_from_header(header):
 
     return WCS(clean)
 
+def _linear_wcs_from_header(header):
+    return WCS(header)
 
 def make_train_datasets_from_raw(
     fits_files,
