@@ -45,13 +45,13 @@ min_frame_coverage = 0.5
 project_name   = 'ASTERIS_euclid'
 train_mode     = 8        # patch_t: 4 or 8 (sets ASTERIS4 vs ASTERIS8)
 n_epochs       = 10
-GPU            = '0'
+GPU            = '0,1,2'
 batch_size     = 3        # per GPU; total = batch_size * n_GPUs
 learning_rate  = 1.5e-4
 patch_xy       = 128
 overlap_factor = 0.1
 num_workers    = 8
-mask_train     = 0        # 1 = mask NaN pixels in loss; 0 = no masking
+mask_train     = 1         # 1 = mask NaN pixels in loss; 0 = no masking
 continue_train = 0        # 1 = resume from checkpoint below
 checkpoint_path = ''
 
@@ -98,11 +98,8 @@ print("Saved footprints.png")
 
 # ── Group frames by dither position ───────────────────────────────────────────
 
-groups = group_frames_by_dither(
-    files,
-    hdu_num=hdu_num,
-    separation_threshold_arcsec=separation_threshold_arcsec,
-)
+# treat all as one group (no separation)
+groups = {0: files}
 
 # ── Reproject each group to a common grid and save ────────────────────────────
 # Frames within each group are projected to a shared WCS so that every pixel
