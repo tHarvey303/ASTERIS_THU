@@ -763,26 +763,45 @@ def make_train_datasets(scale_factor, mse_select, hdu_num, z_axis_clip, clip_thr
         # NaN masking
         image_stack[image_stack == 0] = np.nan
 
+        # Diagnostic: report data statistics to help debug coverage issues
+        finite_pixels = np.isfinite(image_stack).sum()
+        total_pixels  = image_stack.size
+        nan_frac      = 1.0 - finite_pixels / total_pixels
+        max_cov       = int((~np.isnan(image_stack)).sum(axis=0).max())
+        print(
+            f"[make_train_datasets] {rel}: {len(fits_files)} frames, "
+            f"NaN fraction={nan_frac:.3f}, max pixel coverage={max_cov}"
+        )
+
         # Determine the spatial region to use for training
-        if min_coverage is None:
-            # Default: require all frames to be valid at every pixel
-            valid_region = find_valid_region(image_stack)
-        else:
-            # Expanded: require at least min_coverage frames at every pixel,
-            # then drop frames that barely overlap the expanded region
-            valid_region = find_region_with_min_coverage(image_stack, min_coverage)
-            selected = select_frames_for_region(image_stack, valid_region,
-                                                min_frame_coverage=min_frame_coverage)
-            if len(selected) < min_coverage:
-                warnings.warn(
-                    f"[make_train_datasets] Only {len(selected)} frames meet "
-                    f"min_frame_coverage={min_frame_coverage:.0%} in {rel}; "
-                    f"fewer than min_coverage={min_coverage}. "
-                    f"Consider lowering min_frame_coverage."
-                )
-            image_stack = image_stack[selected]
-            header = fits.open(fits_files[int(selected[0])])[hdu_num].header
-        print(valid_region)
+        try:
+            if min_coverage is None:
+                # Default: require all frames to be valid at every pixel
+                valid_region = find_valid_region(image_stack)
+            else:
+                # Expanded: require at least min_coverage frames at every pixel,
+                # then drop frames that barely overlap the expanded region
+                valid_region = find_region_with_min_coverage(image_stack, min_coverage)
+                selected = select_frames_for_region(image_stack, valid_region,
+                                                    min_frame_coverage=min_frame_coverage)
+                if len(selected) < min_coverage:
+                    warnings.warn(
+                        f"[make_train_datasets] Only {len(selected)} frames meet "
+                        f"min_frame_coverage={min_frame_coverage:.0%} in {rel}; "
+                        f"fewer than min_coverage={min_coverage}. "
+                        f"Consider lowering min_frame_coverage."
+                    )
+                image_stack = image_stack[selected]
+                header = fits.open(fits_files[int(selected[0])])[hdu_num].header
+        except ValueError as exc:
+            warnings.warn(
+                f"[make_train_datasets] Skipping {rel}: {exc}. "
+                "If max coverage is 0, the reprojected frames may be entirely "
+                "NaN — check that hdu_names selects the science (SCI) extension "
+                "and not a weight or flag map."
+            )
+            continue
+        print(f"[make_train_datasets] valid_region={valid_region}")
 
         # Crop images to the valid region and update WCS header accordingly
         cropped_images, header_tmp = crop_images_to_valid_region(image_stack, valid_region, header)
@@ -993,16 +1012,30 @@ def group_frames_by_dither(fits_files, hdu_num=0, hdu_names=None,
 
 def _linear_wcs_from_header(header):
     """
-    Return a distortion-free TAN WCS from a FITS header.
+    Return a distortion-free TAN WCS from a FITS header, with CRVAL corrected
+    to the true sky position of CRPIX under the full distortion model.
 
-    Instruments like Euclid VIS carry SIP or TPV polynomial distortion in their
-    WCS headers.  The iterative inverse of these polynomials (needed by
-    reproject during the sky→pixel roundtrip) can fail to converge for sky
-    positions outside the chip footprint, raising InvalidCoordinateError.
+    Two problems must be balanced:
 
-    Keeping only the linear CD/PC + CRPIX/CRVAL terms avoids this.  The error
-    introduced is sub-pixel for typical astronomical distortion amplitudes
-    (< 0.1 arcsec), which is negligible for training patch generation.
+    1. The iterative inverse of SIP/TPV polynomials (needed by reproject for
+       the sky→pixel lookup) diverges for sky positions that fall far outside
+       the chip footprint, which occurs for every chip when the output WCS
+       covers the union of all chips in a group.  Stripping the distortion
+       terms avoids this.
+
+    2. For focal-plane mosaics (e.g. Euclid VIS), all chips share the same
+       nominal CRVAL (the field centre) and the per-chip offset from the field
+       centre is encoded entirely inside the SIP polynomial.  Stripping SIP
+       while keeping the header CRVAL places every chip at the field centre —
+       completely wrong — so reproject finds no valid input pixels and returns
+       an all-zero frame.
+
+    Fix: strip the distortion terms (solving problem 1), but first evaluate the
+    *full* WCS (with SIP/TPV) at CRPIX to get the chip's true sky centre, and
+    write that back as CRVAL (solving problem 2).  The linear WCS then places
+    the chip at the correct sky position; the residual error is the SIP
+    distortion at the chip edges (typically < 1 arcsec), negligible for
+    training patch generation.
     """
     from astropy.io.fits import Header as FitsHeader
     clean = FitsHeader()
@@ -1019,14 +1052,36 @@ def _linear_wcs_from_header(header):
     for key in keep:
         if key in header:
             clean[key] = header[key]
-    # Strip any distortion suffix from the projection type
-    # e.g. 'RA---TAN-SIP' → 'RA---TAN', 'DEC--TAN-SIP' → 'DEC--TAN'
+
+    # Strip distortion suffixes from the projection type so the WCS object
+    # uses a plain TAN projection with no iterative inverse.
     for i in ('1', '2'):
         k = f'CTYPE{i}'
         if k in clean:
-            val = clean[k]
-            if '-SIP' in val:
-                clean[k] = val.replace('-SIP', '')
+            for suffix in ('-SIP', '-TPV', '-ZPN'):
+                if suffix in clean[k]:
+                    clean[k] = clean[k].replace(suffix, '')
+                    break
+
+    # Evaluate the full (distortion-inclusive) WCS at CRPIX to obtain the
+    # chip's true sky centre and write it back as CRVAL.  Without this, the
+    # linear WCS would use the header CRVAL (often the field centre for
+    # focal-plane mosaics) rather than the individual chip centre.
+    try:
+        full_wcs = WCS(header)
+        crpix1 = float(header.get('CRPIX1', 1))
+        crpix2 = float(header.get('CRPIX2', 1))
+        # all_pix2world with origin=1 follows the FITS 1-indexed convention.
+        sky = full_wcs.all_pix2world([[crpix1, crpix2]], 1)
+        clean['CRVAL1'] = float(sky[0, 0])
+        clean['CRVAL2'] = float(sky[0, 1])
+    except Exception as e:
+        warnings.warn(
+            f"_linear_wcs_from_header: could not evaluate full WCS at CRPIX "
+            f"({e}); falling back to header CRVAL. Reprojected chip may be "
+            "misplaced if this is a focal-plane mosaic instrument."
+        )
+
     return WCS(clean)
 
 
@@ -1233,6 +1288,7 @@ def make_train_datasets_from_raw(
                 N = len(candidates)
                 patch_stack = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
                 fp_stack    = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
+                valid_frac  = np.zeros(N, dtype=np.float32)
 
                 for i, chip in enumerate(candidates):
                     result, fp = reproject_fn(
@@ -1240,12 +1296,21 @@ def make_train_datasets_from_raw(
                         shape_out=(patch_xy, patch_xy),
                     )
                     fp32 = fp.astype(np.float32)
-                    patch_stack[i] = np.where(fp32 > 0, result, 0.0).astype(np.float32)
+                    # Convert any NaN within the footprint to 0 (ASTERIS
+                    # no-data convention) rather than letting it propagate.
+                    # NaN appears when bilinear interpolation hits a masked
+                    # input pixel; zeroing it keeps the downstream 0→NaN
+                    # masking consistent without loading the full chip.
+                    out = np.where(fp32 > 0, np.nan_to_num(result, nan=0.0), 0.0)
+                    patch_stack[i] = out.astype(np.float32)
                     fp_stack[i]    = fp32
+                    # valid_frac: fraction of the patch covered by non-zero
+                    # output pixels; accounts for both geometric footprint and
+                    # data NaN (NaN→0 pixels are excluded from valid count).
+                    valid_frac[i]  = float((out != 0).mean())
 
-                # ── Coverage gate: drop frames with thin footprint ─────────────
-                cov_frac  = fp_stack.mean(axis=(1, 2))           # (N,)
-                valid_idx = np.where(cov_frac >= min_frame_coverage)[0]
+                # ── Coverage gate: drop frames with thin valid-data footprint ──
+                valid_idx = np.where(valid_frac >= min_frame_coverage)[0]
 
                 if len(valid_idx) < min_coverage:
                     skipped_cov += 1
@@ -1374,12 +1439,11 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
                 all_hdus = [hdul[hdu_num] for hdul in hduls_to_close]
 
         # Build (data, linear_wcs) tuples for the actual reproject calls.
-        # The original HDUs are still used for find_optimal_celestial_wcs so
-        # that the output grid covers the correct footprint — forward WCS
-        # (pixel→sky) works fine even for distorted chips.  Only the inverse
-        # (sky→pixel, needed by reproject during roundtrip verification) fails
-        # outside the chip footprint; stripping distortion from the reprojection
-        # WCS avoids this with sub-pixel accuracy.
+        # Use a CRVAL-corrected linear WCS for the reproject calls (see
+        # _linear_wcs_from_header for the rationale).  The original HDUs are
+        # still used for find_optimal_celestial_wcs so the output grid covers
+        # the true chip footprints; each chip's linear WCS is then anchored to
+        # its true sky centre so the reprojection finds valid pixels.
         all_inputs = [
             (hdu.data, _linear_wcs_from_header(hdu.header)) for hdu in all_hdus
         ]
@@ -1396,9 +1460,49 @@ def reproject_frames_to_common_grid(fits_files, hdu_num=0, hdu_names=None,
         footprints  = np.zeros((N, *output_shape), dtype=np.float32)
 
         for i, inp in enumerate(tqdm(all_inputs, desc='Reprojecting')):
-            result, fp = reproject_fn(inp, output_wcs, shape_out=output_shape)
+            data_in, wcs_in = inp
+            data_f = np.asarray(data_in, dtype=np.float32)
+
+            # Bilinear interpolation propagates NaN from masked input pixels to
+            # neighbouring output pixels, potentially making the entire footprint
+            # NaN even when most input pixels are valid.  Fix: fill NaN with 0
+            # before reprojecting, and reproject a binary validity mask so we can
+            # zero out output pixels that were interpolated mostly from NaN
+            # regions (restoring the ASTERIS 0 = no-data convention).
+            nan_mask = np.isnan(data_f)
+            nan_frac = nan_mask.mean()
+            if nan_frac == 1.0:
+                warnings.warn(
+                    f"Frame {i}: input data is entirely NaN — "
+                    "reprojected frame will be all-zero (no-data). "
+                    "Check that hdu_names selects the science extension, "
+                    "not a weight/flag map."
+                )
+            # For frames with significant NaN masking (≥1 %), fill NaN with 0
+            # before reprojection (prevents bilinear spreading) and reproject a
+            # validity mask so output pixels interpolated mostly from NaN regions
+            # are zeroed rather than carrying interpolation artefacts.
+            use_mask_reproject = nan_frac >= 0.01
+            if use_mask_reproject:
+                data_filled = np.where(nan_mask, 0.0, data_f)
+                valid_mask  = (~nan_mask).astype(np.float32)
+            else:
+                data_filled = data_f
+                valid_mask  = None
+
+            result, fp = reproject_fn((data_filled, wcs_in), output_wcs, shape_out=output_shape)
             fp = fp.astype(np.float32)
-            reprojected[i] = np.where(fp > 0, result, 0.0).astype(np.float32)
+
+            if valid_mask is not None:
+                valid_proj, _ = reproject_fn((valid_mask, wcs_in), output_wcs, shape_out=output_shape)
+                valid_proj = np.clip(valid_proj, 0.0, 1.0).astype(np.float32)
+                # Require ≥50 % of contributing input pixels to be valid; mask
+                # the rest to 0 so make_train_datasets treats them as no-data.
+                in_footprint = (fp > 0) & (valid_proj >= 0.5)
+            else:
+                in_footprint = fp > 0
+
+            reprojected[i] = np.where(in_footprint, result, 0.0).astype(np.float32)
             footprints[i]  = fp
 
     finally:

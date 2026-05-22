@@ -159,6 +159,22 @@ def reproject_groups(groups: dict, out_dir: str, method: str = 'interp') -> None
             method=method,
         )
 
+        # Diagnostic: summarise reprojected data before saving
+        nonzero_vals = reprojected[reprojected != 0]
+        n_nonzero    = nonzero_vals.size
+        n_total      = reprojected.size
+        if n_nonzero > 0:
+            print(
+                f"  Reprojected: valid pixels={n_nonzero}/{n_total} "
+                f"({100*n_nonzero/n_total:.2f}%), "
+                f"value range [{nonzero_vals.min():.3g}, {nonzero_vals.max():.3g}]"
+            )
+        else:
+            print(
+                "  WARNING: all reprojected pixels are zero/NaN — "
+                "check hdu_names matches the science extension."
+            )
+
         for i, (frame, (filepath, ext_name)) in enumerate(zip(reprojected, chip_pairs)):
             base     = os.path.splitext(os.path.basename(filepath))[0]
             safe_ext = ext_name.replace('.', '_').strip('_')
