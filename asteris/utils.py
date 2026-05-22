@@ -1299,6 +1299,12 @@ def make_train_datasets_from_raw(
     try:
         for y0 in tqdm(y_positions, desc='Scanning rows'):
             for x0 in x_positions:
+                if len(glob(os.path.join(output_path, f"patch_y{y0:05d}_x{x0:05d}_N*.tif"))) > 0:
+                    warnings.warn(
+                        f"Output patch for position (x0={x0}, y0={y0}) already exists; "
+                        "skipping to avoid overwrite."
+                    )
+                    continue
 
                 # ── Bounding-box pre-filter (O(n_chips), no I/O) ──────────────
                 px_lo, px_hi = float(x0),           float(x0 + patch_xy)
@@ -1330,10 +1336,17 @@ def make_train_datasets_from_raw(
                 valid_frac  = np.zeros(N, dtype=np.float32)
 
                 for i, chip in enumerate(candidates):
-                    result, fp = reproject_fn(
-                        chip['reproject_input'], patch_wcs,
-                        shape_out=(patch_xy, patch_xy),
-                    )
+                    try:
+                        result, fp = reproject_fn(
+                            chip['reproject_input'], patch_wcs,
+                            shape_out=(patch_xy, patch_xy),
+                        )
+                    except Exception as e:
+                        warnings.warn(
+                            f"Reprojection failed for chip with bbox {chip['bbox']} "
+                            f"at patch ({x0}, {y0}): {e}. Skipping this chip."
+                        )
+                        continue
                     fp32 = fp.astype(np.float32)
                     # Convert any NaN within the footprint to 0 (ASTERIS
                     # no-data convention) rather than letting it propagate.
