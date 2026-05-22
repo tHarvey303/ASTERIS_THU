@@ -1142,8 +1142,9 @@ def _process_patch(args):
 
     for i, chip in enumerate(candidates):
         try:
+            data, wcs_hdr = chip['reproject_input']
             result, fp = reproject_fn(
-                chip['reproject_input'], patch_wcs,
+                (data, WCS(wcs_hdr)), patch_wcs,
                 shape_out=(patch_xy, patch_xy),
             )
         except Exception as e:
@@ -1310,7 +1311,7 @@ def make_train_datasets_from_raw(
                     ny = hdu.header.get('NAXIS2', 1)
                     chips.append({
                         'hdu'            : hdu,
-                        'reproject_input': (hdu.data, lin_wcs),
+                        'reproject_input': (hdu.data, lin_wcs.to_header()),
                         'wcs'            : cel_wcs,
                         'nx': nx, 'ny': ny,
                     })
@@ -1331,7 +1332,7 @@ def make_train_datasets_from_raw(
                 ny = hdu.header.get('NAXIS2', hdu.data.shape[-2])
                 chips.append({
                     'hdu'            : hdu,
-                    'reproject_input': (hdu.data, lin_wcs),
+                    'reproject_input': (hdu.data, lin_wcs.to_header()),
                     'wcs'            : cel_wcs,
                     'nx': nx, 'ny': ny,
                 })
