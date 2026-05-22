@@ -1192,16 +1192,20 @@ def make_train_datasets_from_raw(
     print("[make_train_datasets_from_raw] Opening files and collecting chips ...")
     chips = []      # list of dicts per chip
     hduls = {}      # filepath → open HDUList (kept open; memmap stays valid)
-
+    if len(fits_files) == 0:
+        raise ValueError("No FITS files provided.")
+    
     for f in fits_files:
         hdul = fits.open(f, memmap=True)
         hduls[f] = hdul
+        print(hdul.info())
         if hdu_names is not None:
             for hdu in hdul:
                 if hdu_names in hdu.name and hdu.is_image and hdu.size > 0:
                     lin_wcs = _linear_wcs_from_header(hdu.header)
                     cel_wcs = lin_wcs.celestial
                     if cel_wcs.naxis == 0:
+                        print('No WCS celestial axes found in header after stripping distortion terms; ')
                         warnings.warn(
                             f"{os.path.basename(f)} [{hdu.name}]: linear WCS has "
                             "no celestial axes after distortion strip — skipping chip."
@@ -1215,11 +1219,14 @@ def make_train_datasets_from_raw(
                         'wcs'            : cel_wcs,
                         'nx': nx, 'ny': ny,
                     })
+                else:
+                    print(f"{os.path.basename(f)} [{hdu.name}]: skipping non-matching HDU.")
         else:
             hdu = hdul[hdu_num]
             lin_wcs = _linear_wcs_from_header(hdu.header)
             cel_wcs = lin_wcs.celestial
             if cel_wcs.naxis == 0:
+                print('No WCS celestial axes found in header after stripping distortion terms; ')
                 warnings.warn(
                     f"{os.path.basename(f)} HDU {hdu_num}: linear WCS has no "
                     "celestial axes after distortion strip — skipping."
