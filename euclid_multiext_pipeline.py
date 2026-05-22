@@ -29,7 +29,8 @@ hdu_names: str = '.SCI'   # extension name substring identifying science chips
 # merge chips covering completely different sky patches into the same group.
 # For Euclid VIS (chip ~204 arcsec, dither step ~100-200 arcsec), 120 arcsec
 # groups chips that have significant overlap across dither positions.
-separation_threshold_arcsec: float = 120.0
+separation_threshold_arcsec: float = 180.0
+drop_groups_below_num: int = 16   # minimum number of chips in a group; set to 2 to exclude singletons
 
 # Reprojection.  'interp' is fast; 'exact' conserves flux (much slower).
 reproject_method: str = 'interp'
@@ -49,7 +50,7 @@ min_frame_coverage: float = 0.5
 project_name   : str   = 'ASTERIS_euclid'
 train_mode     : int   = 8        # 4 or 8 → selects ASTERIS4 / ASTERIS8
 n_epochs       : int   = 10
-GPU            : str   = '0'
+GPU            : str   = '0,1,2,3,4'
 batch_size     : int   = 3        # per GPU
 learning_rate  : float = 1.5e-4
 patch_xy       : int   = 128
@@ -172,23 +173,43 @@ def reproject_groups(groups: dict, out_dir: str, method: str = 'interp') -> None
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
+    skip_grouping_and_reprojection: bool = True  # set to True to skip steps 1-4 and directly preprocess from existing reprojected frames
 
     files: List[str] = sorted(glob.glob(os.path.join(folder, '*.fits')))
     print(f"Found {len(files)} FITS files in {folder}")
 
-    # 1. Plot chip footprints
-    plot_footprints(files, hdu_names=hdu_names)
+    if not skip_grouping_and_reprojection:
+        # 1. Plot chip footprints
+        plot_footprints(files, hdu_names=hdu_names)
+        # 2. Group files by pointing (dither position)
+        groups = group_frames_by_dither(
+            files,
+            hdu_names=hdu_names,
+            separation_threshold_arcsec=separation_threshold_arcsec,
+        )
 
-    # 2. Group files by pointing (dither position)
-    groups = group_frames_by_dither(
-        files,
-        hdu_names=hdu_names,
-        separation_threshold_arcsec=separation_threshold_arcsec,
-    )
+        # drop small groups that don't have enough frames to be useful for training
+        initial_group_count = len(groups)
+        groups = {gid: chips for gid, chips in groups.items() if len(chips) >= drop_groups_below_num}
+        dropped_count = initial_group_count - len(groups)
+        print(f"\nDropped {dropped_count} groups with fewer than {drop_groups_below_num} chips. Remaining groups: {len(groups)}")
 
-    # 3. Reproject each sky group onto a tight common grid for that patch
-    reproject_groups(groups, out_dir=reprojected_dir, method=reproject_method)
+        # 3. Reproject each sky group onto a tight common grid for that patch
+        reproject_groups(groups, out_dir=reprojected_dir, method=reproject_method)
 
+    group_files = []
+    for group_id in sorted(os.listdir(reprojected_dir)):
+        group_dir = os.path.join(reprojected_dir, group_id)
+        if os.path.isdir(group_dir):
+            num_frames = len(glob.glob(os.path.join(group_dir, '*.fits')))
+            print(f"Group {group_id}: {num_frames} reprojected frame(s)")
+            # plot footprints of reprojected frames for visual inspection
+            plot_footprints(glob.glob(os.path.join(group_dir, '*.fits')), hdu_names='', out_path=os.path.join(group_dir, 'reprojected_footprints.png'))
+            group_files.append(
+                glob.glob(os.path.join(group_dir, '*.fits'))[0]
+            )
+    # Then pick one file from each group to plot the overall coverage of the reprojected frames.
+    plot_footprints(group_files, hdu_names='', out_path=os.path.join(reprojected_dir, 'all_reprojected_footprints.png'))
     # 4. Preprocess reprojected chips into normalised training stacks.
     #    Reprojected frames are PrimaryHDU → hdu_num=0.
     #    min_coverage expands the usable area to regions covered by at least
