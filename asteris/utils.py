@@ -1117,6 +1117,7 @@ def _process_patch(args):
      output_path, reproject_fn, global_wcs_header) = args
 
     if len(glob(os.path.join(output_path, f"patch_y{y0:05d}_x{x0:05d}_N*.tif"))) > 0:
+        print(f"Skipping patch ({x0}, {y0}): output file already exists.")
         return (0, 0, 0)
 
     px_lo, px_hi = float(x0), float(x0 + patch_xy)
@@ -1128,6 +1129,8 @@ def _process_patch(args):
             c['bbox'][2] < py_hi and c['bbox'][3] > py_lo)
     ]
     if len(candidates) < min_coverage:
+        print(f"Skipping patch ({x0}, {y0}): only {len(candidates)} candidate frames "
+              f"overlap the patch (required {min_coverage}).")
         return (0, 1, 0)
 
     _phdr = global_wcs_header.copy()
@@ -1161,6 +1164,8 @@ def _process_patch(args):
 
     valid_idx = np.where(valid_frac >= min_frame_coverage)[0]
     if len(valid_idx) < min_coverage:
+        print(f"Skipping patch ({x0}, {y0}): only {len(valid_idx)} frames with "
+              f"valid coverage >= {min_frame_coverage:.0%} (required {min_coverage}).")
         return (0, 0, 1)
 
     stack = patch_stack[valid_idx].copy()
@@ -1185,6 +1190,7 @@ def _process_patch(args):
 
     n_frames = stack.shape[0]
     fname = f"patch_y{y0:05d}_x{x0:05d}_N{n_frames:03d}.tif"
+    print(f"Saving patch: {fname} (coverage={len(valid_idx)}/{len(candidates)})")
     tiff.imwrite(
         os.path.join(output_path, fname),
         stack.astype(np.float32),
