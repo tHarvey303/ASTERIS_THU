@@ -26,6 +26,7 @@ import re
 import warnings
 import shutil
 import tifffile as tiff
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from scipy.stats import sigmaclip
 from scipy.io import savemat,loadmat
@@ -1103,6 +1104,93 @@ def _linear_wcs_from_header(header):
 def _linear_wcs_from_header(header):
     return WCS(header)
 
+def _process_patch(args):
+    """
+    Process a single (y0, x0) patch position for make_train_datasets_from_raw.
+
+    Designed to run in a ThreadPoolExecutor worker; all inputs are either
+    read-only shared objects (chips, global_wcs_header) or plain values.
+    Returns (saved, skipped_bbox, skipped_cov) counts as a 3-tuple.
+    """
+    (y0, x0, chips, patch_xy, min_coverage, min_frame_coverage,
+     z_axis_clip, clip_threshold, mse_select, scale_factor,
+     output_path, reproject_fn, global_wcs_header) = args
+
+    if len(glob(os.path.join(output_path, f"patch_y{y0:05d}_x{x0:05d}_N*.tif"))) > 0:
+        return (0, 0, 0)
+
+    px_lo, px_hi = float(x0), float(x0 + patch_xy)
+    py_lo, py_hi = float(y0), float(y0 + patch_xy)
+
+    candidates = [
+        c for c in chips
+        if (c['bbox'][0] < px_hi and c['bbox'][1] > px_lo and
+            c['bbox'][2] < py_hi and c['bbox'][3] > py_lo)
+    ]
+    if len(candidates) < min_coverage:
+        return (0, 1, 0)
+
+    _phdr = global_wcs_header.copy()
+    _phdr['CRPIX1'] = float(global_wcs_header['CRPIX1']) - x0
+    _phdr['CRPIX2'] = float(global_wcs_header['CRPIX2']) - y0
+    patch_wcs = WCS(_phdr)
+
+    N = len(candidates)
+    patch_stack = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
+    fp_stack    = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
+    valid_frac  = np.zeros(N, dtype=np.float32)
+
+    for i, chip in enumerate(candidates):
+        try:
+            result, fp = reproject_fn(
+                chip['reproject_input'], patch_wcs,
+                shape_out=(patch_xy, patch_xy),
+            )
+        except Exception as e:
+            warnings.warn(
+                f"Reprojection failed for chip with bbox {chip['bbox']} "
+                f"at patch ({x0}, {y0}): {e}. Skipping this chip."
+            )
+            continue
+        fp32 = fp.astype(np.float32)
+        out = np.where(fp32 > 0, np.nan_to_num(result, nan=0.0), 0.0)
+        patch_stack[i] = out.astype(np.float32)
+        fp_stack[i]    = fp32
+        valid_frac[i]  = float((out != 0).mean())
+
+    valid_idx = np.where(valid_frac >= min_frame_coverage)[0]
+    if len(valid_idx) < min_coverage:
+        return (0, 0, 1)
+
+    stack = patch_stack[valid_idx].copy()
+    stack[stack == 0] = np.nan
+
+    if z_axis_clip > 0:
+        stack = sigma_clipping_zaxis(stack, sigma=z_axis_clip)
+
+    if clip_threshold > 0:
+        stack, clip_part = sigma_clip_3d_nonzero(
+            stack, low_sigma=clip_threshold, high_sigma=clip_threshold)
+    else:
+        clip_part = np.zeros_like(stack)
+
+    if mse_select == 1:
+        stack, clip_part, _ = mse_select_bad_frame(stack, clip_part)
+
+    stack, _std, _mean = z_score_normalize_3d_stack(stack)
+    stack /= scale_factor
+    stack += 1
+    stack[np.isnan(stack)] = 0
+
+    n_frames = stack.shape[0]
+    fname = f"patch_y{y0:05d}_x{x0:05d}_N{n_frames:03d}.tif"
+    tiff.imwrite(
+        os.path.join(output_path, fname),
+        stack.astype(np.float32),
+    )
+    return (1, 0, 0)
+
+
 def make_train_datasets_from_raw(
     fits_files,
     output_path,
@@ -1118,6 +1206,7 @@ def make_train_datasets_from_raw(
     pixel_scale_arcsec=None,
     hdu_names=None,
     hdu_num=0,
+    n_workers=None,
 ):
     """
     Build normalised training patches directly from raw FITS files in one pass.
@@ -1170,6 +1259,10 @@ def make_train_datasets_from_raw(
             extension in every file is treated as an independent chip.
             When None, hdu_num selects a single extension per file.
         hdu_num (int): Extension index; used only when hdu_names is None.
+        n_workers (int, optional): Number of parallel threads for patch
+            processing.  Defaults to os.cpu_count().  Each thread
+            reprojects and preprocesses an independent (y0, x0) position;
+            the shared chip memmaps are read-only so no locking is needed.
     """
     try:
         from reproject import reproject_interp, reproject_exact
@@ -1296,111 +1389,26 @@ def make_train_datasets_from_raw(
 
     saved = skipped_bbox = skipped_cov = 0
 
+    if n_workers is None:
+        n_workers = os.cpu_count() or 1
+
+    all_positions = [
+        (y0, x0, chips, patch_xy, min_coverage, min_frame_coverage,
+         z_axis_clip, clip_threshold, mse_select, scale_factor,
+         output_path, reproject_fn, _global_wcs_header)
+        for y0 in y_positions for x0 in x_positions
+    ]
+
     try:
-        for y0 in tqdm(y_positions, desc='Scanning rows'):
-            for x0 in x_positions:
-                if len(glob(os.path.join(output_path, f"patch_y{y0:05d}_x{x0:05d}_N*.tif"))) > 0:
-                    warnings.warn(
-                        f"Output patch for position (x0={x0}, y0={y0}) already exists; "
-                        "skipping to avoid overwrite."
-                    )
-                    continue
-
-                # ── Bounding-box pre-filter (O(n_chips), no I/O) ──────────────
-                px_lo, px_hi = float(x0),           float(x0 + patch_xy)
-                py_lo, py_hi = float(y0),           float(y0 + patch_xy)
-
-                candidates = [
-                    c for c in chips
-                    if (c['bbox'][0] < px_hi and c['bbox'][1] > px_lo and
-                        c['bbox'][2] < py_hi and c['bbox'][3] > py_lo)
-                ]
-                if len(candidates) < min_coverage:
-                    skipped_bbox += 1
-                    continue
-
-                # ── Local WCS for this patch ───────────────────────────────────
-                # Build from the cached header rather than deepcopy so no
-                # internal wcslib distortion state is carried over.
-                # CRPIX1/2 are shifted by the 0-indexed (col, row) offset so
-                # that global FITS pixel (x0+1, y0+1) maps to patch pixel (1,1).
-                _phdr = _global_wcs_header.copy()
-                _phdr['CRPIX1'] = float(_global_wcs_header['CRPIX1']) - x0
-                _phdr['CRPIX2'] = float(_global_wcs_header['CRPIX2']) - y0
-                patch_wcs = WCS(_phdr)
-
-                # ── Reproject each candidate into the patch grid ───────────────
-                N = len(candidates)
-                patch_stack = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
-                fp_stack    = np.zeros((N, patch_xy, patch_xy), dtype=np.float32)
-                valid_frac  = np.zeros(N, dtype=np.float32)
-
-                for i, chip in enumerate(candidates):
-                    try:
-                        result, fp = reproject_fn(
-                            chip['reproject_input'], patch_wcs,
-                            shape_out=(patch_xy, patch_xy),
-                        )
-                    except Exception as e:
-                        warnings.warn(
-                            f"Reprojection failed for chip with bbox {chip['bbox']} "
-                            f"at patch ({x0}, {y0}): {e}. Skipping this chip."
-                        )
-                        continue
-                    fp32 = fp.astype(np.float32)
-                    # Convert any NaN within the footprint to 0 (ASTERIS
-                    # no-data convention) rather than letting it propagate.
-                    # NaN appears when bilinear interpolation hits a masked
-                    # input pixel; zeroing it keeps the downstream 0→NaN
-                    # masking consistent without loading the full chip.
-                    out = np.where(fp32 > 0, np.nan_to_num(result, nan=0.0), 0.0)
-                    patch_stack[i] = out.astype(np.float32)
-                    fp_stack[i]    = fp32
-                    # valid_frac: fraction of the patch covered by non-zero
-                    # output pixels; accounts for both geometric footprint and
-                    # data NaN (NaN→0 pixels are excluded from valid count).
-                    valid_frac[i]  = float((out != 0).mean())
-
-                # ── Coverage gate: drop frames with thin valid-data footprint ──
-                valid_idx = np.where(valid_frac >= min_frame_coverage)[0]
-
-                if len(valid_idx) < min_coverage:
-                    skipped_cov += 1
-                    continue
-
-                stack = patch_stack[valid_idx].copy()  # (N_valid, H, W)
-
-                # ── Preprocessing (mirrors make_train_datasets) ────────────────
-                stack[stack == 0] = np.nan
-
-                if z_axis_clip > 0:
-                    stack = sigma_clipping_zaxis(stack, sigma=z_axis_clip)
-
-                if clip_threshold > 0:
-                    stack, clip_part = sigma_clip_3d_nonzero(
-                        stack,
-                        low_sigma=clip_threshold,
-                        high_sigma=clip_threshold,
-                    )
-                else:
-                    clip_part = np.zeros_like(stack)
-
-                if mse_select == 1:
-                    stack, clip_part, _ = mse_select_bad_frame(stack, clip_part)
-
-                stack, _std, _mean = z_score_normalize_3d_stack(stack)
-                stack /= scale_factor
-                stack += 1
-                stack[np.isnan(stack)] = 0
-
-                # ── Save ───────────────────────────────────────────────────────
-                n_frames = stack.shape[0]
-                fname = f"patch_y{y0:05d}_x{x0:05d}_N{n_frames:03d}.tif"
-                tiff.imwrite(
-                    os.path.join(output_path, fname),
-                    stack.astype(np.float32),
-                )
-                saved += 1
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            for s, sb, sc in tqdm(
+                executor.map(_process_patch, all_positions),
+                total=len(all_positions),
+                desc='Processing patches',
+            ):
+                saved        += s
+                skipped_bbox += sb
+                skipped_cov  += sc
 
     finally:
         for hdul in hduls.values():
