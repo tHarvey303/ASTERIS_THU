@@ -1040,7 +1040,10 @@ def _linear_wcs_from_header(header):
     from astropy.io.fits import Header as FitsHeader
     clean = FitsHeader()
     keep = {
-        'NAXIS', 'NAXIS1', 'NAXIS2',
+        # Deliberately exclude 'NAXIS' — we set it to 2 explicitly below so
+        # that degenerate extra axes in the source header cannot produce a WCS
+        # with 0 celestial axes after the .celestial extraction.
+        'NAXIS1', 'NAXIS2',
         'CTYPE1', 'CTYPE2',
         'CRPIX1', 'CRPIX2',
         'CRVAL1', 'CRVAL2',
@@ -1052,6 +1055,10 @@ def _linear_wcs_from_header(header):
     for key in keep:
         if key in header:
             clean[key] = header[key]
+
+    # Always declare exactly 2 WCS axes so wcslib cannot inherit a degenerate
+    # NAXIS value (e.g. 0 or 3) from the source header.
+    clean['NAXIS'] = 2
 
     # Strip distortion suffixes from the projection type so the WCS object
     # uses a plain TAN projection with no iterative inverse.
@@ -1072,9 +1079,18 @@ def _linear_wcs_from_header(header):
         crpix1 = float(header.get('CRPIX1', 1))
         crpix2 = float(header.get('CRPIX2', 1))
         # all_pix2world with origin=1 follows the FITS 1-indexed convention.
+        # Use only the first two WCS axes in case the source header has more.
         sky = full_wcs.all_pix2world([[crpix1, crpix2]], 1)
-        clean['CRVAL1'] = float(sky[0, 0])
-        clean['CRVAL2'] = float(sky[0, 1])
+        ra, dec = float(sky[0, 0]), float(sky[0, 1])
+        if np.isfinite(ra) and np.isfinite(dec):
+            clean['CRVAL1'] = ra
+            clean['CRVAL2'] = dec
+        else:
+            warnings.warn(
+                f"_linear_wcs_from_header: full WCS at CRPIX returned "
+                f"non-finite coordinates (RA={ra}, Dec={dec}); "
+                "keeping header CRVAL — chip may be misplaced."
+            )
     except Exception as e:
         warnings.warn(
             f"_linear_wcs_from_header: could not evaluate full WCS at CRPIX "
@@ -1184,25 +1200,39 @@ def make_train_datasets_from_raw(
             for hdu in hdul:
                 if hdu_names in hdu.name and hdu.is_image and hdu.size > 0:
                     lin_wcs = _linear_wcs_from_header(hdu.header)
+                    cel_wcs = lin_wcs.celestial
+                    if cel_wcs.naxis == 0:
+                        warnings.warn(
+                            f"{os.path.basename(f)} [{hdu.name}]: linear WCS has "
+                            "no celestial axes after distortion strip — skipping chip."
+                        )
+                        continue
                     nx = hdu.header.get('NAXIS1', 1)
                     ny = hdu.header.get('NAXIS2', 1)
                     chips.append({
                         'hdu'            : hdu,
                         'reproject_input': (hdu.data, lin_wcs),
-                        'wcs'            : lin_wcs.celestial,
+                        'wcs'            : cel_wcs,
                         'nx': nx, 'ny': ny,
                     })
         else:
             hdu = hdul[hdu_num]
             lin_wcs = _linear_wcs_from_header(hdu.header)
-            nx = hdu.header.get('NAXIS1', hdu.data.shape[-1])
-            ny = hdu.header.get('NAXIS2', hdu.data.shape[-2])
-            chips.append({
-                'hdu'            : hdu,
-                'reproject_input': (hdu.data, lin_wcs),
-                'wcs'            : lin_wcs.celestial,
-                'nx': nx, 'ny': ny,
-            })
+            cel_wcs = lin_wcs.celestial
+            if cel_wcs.naxis == 0:
+                warnings.warn(
+                    f"{os.path.basename(f)} HDU {hdu_num}: linear WCS has no "
+                    "celestial axes after distortion strip — skipping."
+                )
+            else:
+                nx = hdu.header.get('NAXIS1', hdu.data.shape[-1])
+                ny = hdu.header.get('NAXIS2', hdu.data.shape[-2])
+                chips.append({
+                    'hdu'            : hdu,
+                    'reproject_input': (hdu.data, lin_wcs),
+                    'wcs'            : cel_wcs,
+                    'nx': nx, 'ny': ny,
+                })
 
     n_chips = len(chips)
     print(f"  {len(fits_files)} file(s) → {n_chips} chip(s)")
