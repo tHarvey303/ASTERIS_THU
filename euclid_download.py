@@ -50,7 +50,7 @@ def download_file(
 
     url = (
         f"https://easidr.esac.esa.int/sas-dd/data"
-        f"?file_name={file_name}&release={release}&RETRIEVAL_TYPE=FILE"
+        f"?file_name={file_name}&release={release}&retrieval_type=FILE"
     )
     tmp = output_path + ".part"
     cmd = ["curl", "-k", "-s", "-b", cookie_file, "-o", tmp, url]
