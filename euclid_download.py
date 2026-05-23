@@ -50,10 +50,11 @@ def download_file(
 
     url = (
         f"https://easidr.esac.esa.int/sas-dd/data"
-        f"?file_name={file_name}&release={release}&RETRIEVAL_TYPE=FILE"
+        f"?file_name={file_name}&release={release}&retrieval_type=FILE"
     )
     tmp = output_path + ".part"
     cmd = ["curl", "-k", "-s", "-b", cookie_file, "-o", tmp, url]
+    print(' '.join(cmd))
     result = subprocess.run(cmd, capture_output=True)
 
     if result.returncode != 0:
@@ -93,7 +94,7 @@ def main() -> None:
     parser.add_argument("--output", default="./euclid_raw/", help="Output directory")
     parser.add_argument("--column", default="file_name", help="VOTable column with filenames")
     parser.add_argument("--cred", default="cred.txt", help="Credentials file (user\\npass)")
-    parser.add_argument("--release", default="dr1", help="Data release (default: dr1)")
+    parser.add_argument("--release", default="sedm", help="Data release (default: sedm)")
     parser.add_argument("--workers", type=int, default=4, help="Parallel downloads")
     parser.add_argument("--cookie", default="cookies.txt", help="Cookie jar file")
     args = parser.parse_args()
