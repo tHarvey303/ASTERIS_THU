@@ -7,6 +7,7 @@ import tifffile as tiff
 import math
 import torch
 import time
+from tqdm import tqdm
 import datetime
 import swanlab
 from .ASTERIS_net_8 import ASTERIS8 
@@ -49,6 +50,7 @@ class training_class():
         self.ngpu = 1
         self.num_workers = 0
         self.checkpoint_path = ''
+        self.max_patch_num = 1000000
         self.set_params(params_dict)
         self.mask_train = 0
 
@@ -174,17 +176,24 @@ class training_class():
         
         ###### Collect all image file paths under dataset folder and subfolders ########
         self.all_file_paths = []
+        i = 0
         for root, dirs, files in os.walk(self.datasets_path):
             for file in files:
-                self.all_file_paths.append(os.path.join(root, file))
+                if i < self.max_patch_num:
+                    self.all_file_paths.append(os.path.join(root, file))
+                i += 1
         self.stack_num = len(self.all_file_paths)   
         print('Total stack number -----> ', self.stack_num)
         
         # Iterate through each image stack file
-        for im_name in self.all_file_paths:
-            print('Noise image name -----> ', im_name)
+        for im_name in tqdm(self.all_file_paths, desc="Processing image stacks"):
+            #print('Noise image name -----> ', im_name)
             # Load 3D stack in tif format
-            noise_im = tiff.imread(im_name)
+            try:
+                noise_im = tiff.imread(im_name)
+            except Exception as e:
+                print(f"Error reading {im_name}: {e}")
+                continue
             # Dimensions
             self.whole_x = noise_im.shape[2]
             self.whole_y = noise_im.shape[1]

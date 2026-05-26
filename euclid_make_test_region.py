@@ -47,7 +47,7 @@ from asteris.utils import (
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # Input data
-folder    : str  = '/path/to/nisp/images/'
+folder    : str  = '/cosma7/data/dp276/dc-harv3/work/images/euclid/CDFS/VIS/cal'
 hdu_names : str  = '.SCI'   # substring to match science HDU names; None → use hdu_num
 hdu_num   : int  = 0        # fallback HDU index when hdu_names is None
 
@@ -70,7 +70,7 @@ mse_sort      : bool  = True  # sort frames by ascending MSE before averaging
 nmean         : int   = 8     # averaged output frames (= test_mode in ASTERIS_test.py)
 
 # Output
-out_dir : str = './test_datasets/nisp_central/'
+out_dir : str = '/cosma7/data/dp276/dc-harv3/work/images/euclid/CDFS/VIS/infer/'
 prefix  : str = 'nisp_central'
 
 # ── Target WCS builder ────────────────────────────────────────────────────────
