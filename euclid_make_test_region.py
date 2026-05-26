@@ -344,8 +344,32 @@ def main():
     stack += 1.0
 
     num_slices = stack.shape[0]
-    print(f"Averaging {num_slices} frames into {nmean} output frames ...")
-    stack_nmean = process_nmean(stack, nmean=nmean)
+
+    if num_slices <= nmean:
+        # Enough individual frames to fill the temporal slot without averaging.
+        # Pad to exactly nmean by repeating the last frame if needed (rare).
+        if num_slices < nmean:
+            pad = nmean - num_slices
+            print(f"Only {num_slices} frames available; padding last frame × {pad} to reach {nmean}.")
+            stack = np.concatenate([stack, np.repeat(stack[[-1]], pad, axis=0)], axis=0)
+        stack_nmean = stack.copy()
+        print(f"Using all {num_slices} individual frames (no temporal averaging).")
+    else:
+        # More frames than the model's temporal window.  Group-averaging destroys
+        # inter-frame variance that the network was trained to exploit.  Instead,
+        # select the best nmean frames by MSE against the stack mean — these are
+        # the frames closest to the consensus signal, i.e. lowest noise outliers.
+        print(f"{num_slices} frames > nmean={nmean}: selecting best {nmean} by MSE ...")
+        mean_img   = np.nanmean(stack, axis=0)
+        mse_vals   = np.array([
+            np.nanmean((stack[i] - mean_img) ** 2) for i in range(num_slices)
+        ])
+        best_idx   = np.argsort(mse_vals)[:nmean]          # lowest MSE = best match
+        best_idx   = np.sort(best_idx)                     # preserve temporal order
+        stack_nmean = stack[best_idx].copy()
+        print(f"  Selected frame indices: {best_idx.tolist()} "
+              f"(MSE range {mse_vals[best_idx].min():.4f}–{mse_vals[best_idx].max():.4f})")
+
     stack_nmean[np.isnan(stack_nmean)] = 0.0
 
     # ── Save outputs (make_stack format) ─────────────────────────────────────
@@ -382,13 +406,13 @@ def main():
     tiff.imwrite(clip_path, median_clip.astype(np.float32))
     print(f"Saved clip part: {clip_path}")
 
-    # Header FITS: write target WCS into a zero-data primary HDU
-    wcs_header       = target_wcs.to_header()
-    wcs_header['NAXIS1'] = image_width_pix
-    wcs_header['NAXIS2'] = image_height_pix
+    # Header FITS: write target WCS into a zero-data primary HDU.
+    # Do NOT set NAXIS1/NAXIS2 manually on the WCS header — PrimaryHDU sets
+    # them automatically from the data shape at the correct header position.
+    # Adding them manually causes a VerifyError ("card at the wrong place").
     hdr_hdu = fits.PrimaryHDU(
         data=np.zeros((image_height_pix, image_width_pix), dtype=np.float32),
-        header=wcs_header,
+        header=target_wcs.to_header(),
     )
     hdr_hdu.writeto(hdr_path, overwrite=True)
     print(f"Saved WCS header: {hdr_path}")
