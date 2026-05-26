@@ -1,21 +1,25 @@
 """
 euclid_asteris_test_and_stack.py
 
-Run ASTERIS inference on data prepared by euclid_make_test_region.py and
-collapse the denoised temporal cube into a final 2D image using an optimal
-MAD-weighted, sigma-clipped stack.
+Run ASTERIS inference on data prepared by euclid_make_test_region.py or
+euclid_make_test_groups.py, then optimally combine everything into a final
+denoised 2D FITS image.
 
-The default testing_class collapses the (nmean, H, W) denoised cube with a
-simple np.nanmean.  This script subclasses it and replaces that step with:
-  1. Per-pixel sigma-clipping along the temporal axis (using MAD scale).
-  2. Per-frame inverse-variance weighting (1 / frame_MAD²).
-  3. NaN-aware weighted mean.
+Two stacking stages
+-------------------
+Stage 1 — temporal (inside each group TIF):
+    Replace the default np.nanmean collapse of the (nmean, H, W) denoised cube
+    with a per-pixel MAD-weighted sigma-clipped combination.
 
-Everything else — patch extraction, inference, stitching, restore_fits — is
-unchanged, so outputs are drop-in compatible with the original pipeline.
+Stage 2 — cross-group (across all group TIFs, per checkpoint):
+    After ASTERIS has processed every group TIF the per-group denoised FITS
+    files are combined with a second MAD-weighted sigma-clip stack.  This is
+    the main noise-reduction step when euclid_make_test_groups.py produced
+    many groups from a large dataset.
 
-If multiple .pth checkpoints exist the script also sigma-clips and co-adds the
-per-checkpoint restored FITS files at the end, giving a further noise reduction.
+Stage 3 (optional) — cross-checkpoint:
+    If multiple .pth checkpoint files exist, the per-checkpoint group stacks
+    are further combined into a single final image.
 """
 
 import os
@@ -33,28 +37,33 @@ from asteris.test  import testing_class
 from asteris.utils import restore_fits
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-# Point these at the output of euclid_make_test_region.py.
+# Point datasets_path at images_for_test/ from either:
+#   euclid_make_test_region.py  (single region, one TIF)
+#   euclid_make_test_groups.py  (grouped exposures, many TIFs)
 
-datasets_path : str   = './test_datasets/nisp_central/images_for_test/'
+datasets_path : str   = './test_datasets/nisp_grouped/images_for_test/'
 save_path     : str   = './result/'
 pth_dir       : str   = './pth/'
-denoise_model : str   = 'ASTERIS8_nrcshort'  # folder name under pth_dir
-test_mode     : int   = 8                    # 4 or 8 — must match the trained model
+denoise_model : str   = 'ASTERIS8_nrcshort'   # folder under pth_dir
+test_mode     : int   = 8                     # 4 or 8 — must match training
 GPU           : str   = '0'
 batch_size    : int   = 1
 patch_xy      : int   = 512
 overlap_factor: float = 0.1
 num_workers   : int   = 8
 
-# Preprocessing constants — must match euclid_make_test_region.py
 scale_factor    : float = 4.0
 restore_clip_part: bool = False
 
-# Stacking options
-opt_sigma_clip    : float = 3.0   # sigma threshold for per-pixel temporal clip; 0 to disable
-opt_min_frames    : int   = 2     # minimum valid frames required to produce a result pixel
-# Cross-checkpoint stacking: if >1 checkpoint in pth_dir/denoise_model, combine their
-# individual output FITS files with the same MAD-weighted stack.
+# Stage 1 — temporal stack within each group TIF
+opt_sigma_clip : float = 3.0   # per-pixel temporal clip threshold; 0 = off
+opt_min_frames : int   = 2     # pixels with fewer valid frames → NaN
+
+# Stage 2 — cross-group stack (all group FITS → one image per checkpoint)
+cross_group_stack : bool  = True
+cross_group_sigma : float = 3.0
+
+# Stage 3 — cross-checkpoint stack (only fires when >1 .pth file exists)
 cross_ckpt_stack  : bool  = True
 cross_ckpt_sigma  : float = 3.0
 
@@ -412,6 +421,8 @@ class OptimalTestingClass(testing_class):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    import shutil
+
     test_dict = {
         'restore_clip_part' : restore_clip_part,
         'patch_x'           : patch_xy,
@@ -445,35 +456,56 @@ def main():
     tc.distribute_GPU()
     tc.test()
 
-    # ── Cross-checkpoint stacking ─────────────────────────────────────────────
-    if not cross_ckpt_stack:
-        return
+    # ── Stage 2: Cross-group stack (per checkpoint) ───────────────────────────
+    # Each checkpoint produced one restored FITS per group TIF.  Stack all
+    # group images into a single denoised image for each checkpoint.
+    out_group_dir    = os.path.join(tc.output_path, 'group_stack')
+    per_ckpt_stacked = {}   # pth_name → path to this checkpoint's group stack
 
-    # Collect all per-checkpoint denoised FITS paths, grouped by input image
-    # (stem name), then stack across checkpoints for each image.
-    from collections import defaultdict
-    per_image: dict = defaultdict(list)
-    for pth_name, paths in tc.saved_denoised_paths.items():
-        for p in paths:
-            stem = os.path.splitext(os.path.basename(p))[0]  # e.g. nisp_central_restored
-            per_image[stem].append(p)
+    if cross_group_stack:
+        os.makedirs(out_group_dir, exist_ok=True)
 
-    if all(len(v) < 2 for v in per_image.values()):
-        print("\nOnly one checkpoint found — cross-checkpoint stacking skipped.")
-        return
+        for pth_name, paths in tc.saved_denoised_paths.items():
+            if not paths:
+                continue
+            n_groups = len(paths)
+            print(f"\nStage 2 — cross-group stack ({n_groups} groups, checkpoint {pth_name})")
+            out_fits = os.path.join(
+                out_group_dir,
+                f"group_stack_{pth_name.replace('.pth', '')}.fits",
+            )
+            fits_optimal_stack(
+                sorted(paths),
+                sigma_clip=cross_group_sigma,
+                min_frames=1,    # every pixel valid in ≥1 group contributes
+                output_path=out_fits,
+            )
+            per_ckpt_stacked[pth_name] = out_fits
+    else:
+        # No cross-group stack requested; treat each group output as final.
+        # In this case per_ckpt_stacked stays empty and stage 3 is skipped.
+        print("\nCross-group stacking skipped (cross_group_stack=False).")
 
-    out_cross = os.path.join(tc.output_path, 'cross_checkpoint_stack')
-    os.makedirs(out_cross, exist_ok=True)
-    print(f"\nCross-checkpoint stacking → {out_cross}")
+    # ── Stage 3: Cross-checkpoint stack ──────────────────────────────────────
+    # If multiple checkpoints were stacked in stage 2, combine those images.
+    final_fits = os.path.join(tc.output_path, 'final_denoised.fits')
 
-    for stem, paths in per_image.items():
-        out_fits = os.path.join(out_cross, stem + '_coadded.fits')
+    if cross_ckpt_stack and len(per_ckpt_stacked) > 1:
+        ckpt_paths = sorted(per_ckpt_stacked.values())
+        print(f"\nStage 3 — cross-checkpoint stack ({len(ckpt_paths)} checkpoints)")
         fits_optimal_stack(
-            sorted(paths),
+            ckpt_paths,
             sigma_clip=cross_ckpt_sigma,
-            min_frames=max(1, len(paths) // 2),
-            output_path=out_fits,
+            min_frames=1,
+            output_path=final_fits,
         )
+        print(f"\nFinal denoised image → {final_fits}")
+    elif len(per_ckpt_stacked) == 1:
+        shutil.copy(next(iter(per_ckpt_stacked.values())), final_fits)
+        print(f"\nSingle checkpoint — final image copied to {final_fits}")
+    else:
+        print("\nNo group stacks produced; see individual group outputs under "
+              f"{tc.output_path}")
 
 
 if __name__ == '__main__':
